@@ -1,0 +1,1697 @@
+// Package vclpoll is the CGo bridge to VPP's VCL Locked Sessions (vls_*) API.
+//
+// Current implementation:
+//   - All sessions are non-blocking and use exact readiness waiters.
+//   - Mode 3 pins immediate calls and uses one persistent shared VLS epoll.
+//   - Mode 2 routes operations to lifetime-pinned owner workers, each with its
+//     own VLS epoll and message queue.
+//   - Public TCP and UDP connects use split-connect plus the selected
+//     readiness dispatcher so context cancellation closes in-flight sessions.
+//   - Legacy low-level dial helpers retain finite compatibility waits.
+package vclpoll
+
+/*
+// VPP discovery is driven entirely by pkg-config. The repository ships
+// pkgconfig/vppcom.pc.in; run
+//
+//	make pc VPP_PREFIX=/path/to/vpp
+//
+// to render pkgconfig/vppcom.pc for a specific VPP install, then build with
+// PKG_CONFIG_PATH pointed at that directory (the Makefile does this for you).
+// Alternatively, install a vppcom.pc file into the system pkg-config search
+// path (or set PKG_CONFIG_PATH yourself).
+#cgo pkg-config: vppcom
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/epoll.h>
+#include <vcl/vppcom.h>
+#include <vcl/vcl_locked.h>
+
+static unsigned long vclpoll_pthread_self(void) {
+    return (unsigned long)pthread_self();
+}
+
+static int vclpoll_app_create(const char *name) {
+    return vls_app_create((char *)name);
+}
+
+static void vclpoll_app_destroy(void) {
+    vppcom_app_destroy();
+}
+
+static void vclpoll_register_worker(void) {
+    vls_register_vcl_worker();
+}
+
+// vls_unregister_vcl_worker is the symmetric counterpart of
+// vls_register_vcl_worker. It clears the pthread-key first (so
+// vls_mt_del becomes a no-op), then decrements VLS thread bookkeeping,
+// releases any VLS locks held, and finally calls
+// vppcom_worker_unregister to free the VCL worker. Returns 0 on
+// success, -1 if the pthread-key could not be cleared (in which case
+// no state is modified).
+static int vclpoll_worker_unregister(void) {
+    return vls_unregister_vcl_worker();
+}
+
+static uint32_t vclpoll_worker_index(void) {
+    return vppcom_worker_index();
+}
+
+static int vclpoll_mode2_enabled(void) {
+    return vls_mt_wrk_supported() != 0;
+}
+
+static void vclpoll_session_worker(int vlsh, uint32_t *session_index,
+                                   uint32_t *worker_index) {
+    vlsh_to_session_and_worker_index((vls_handle_t)vlsh, session_index,
+                                     worker_index);
+}
+
+// Create a non-blocking TCP listener bound to the given IPv4+port (BE).
+// SO_REUSEPORT is enabled so that multiple workers can each own a listener
+// on the same endpoint (sharded accept).
+static int vclpoll_listen_tcp4_nb(uint32_t ip4_be, uint16_t port_be,
+                                  int backlog) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
+    if (vlsh < 0) return vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    int rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, backlog);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Create a non-blocking TCP socket and initiate a connect to ip4:port.
+// Returns:
+//   >=0 on success (immediate connect — rare for VCL),
+//   -EINPROGRESS if the connect is in flight (caller must wait for EPOLLOUT),
+//   <0 errno on hard failure.
+// On any negative return the caller is expected to call vclpoll_close on
+// out_vlsh if it was set (>=0).
+static int vclpoll_connect_tcp4_nb(uint32_t ip4_be, uint16_t port_be,
+                                   int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Non-blocking accept. Returns:
+//   >=0 : new vlsh
+//   <0  : negative errno (-EAGAIN if no pending conn)
+static int vclpoll_accept_nb(int listener_vlsh,
+                             uint32_t *peer_ip4_be,
+                             uint16_t *peer_port_be) {
+    uint8_t ip[16] = {0};
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.ip = ip;
+
+    vls_handle_t conn = vls_accept((vls_handle_t)listener_vlsh, &ep,
+                                   O_NONBLOCK);
+    if (conn < 0) return (int)conn;
+
+    if (peer_ip4_be && ep.is_ip4 == VPPCOM_IS_IP4) memcpy(peer_ip4_be, ip, 4);
+    if (peer_port_be) *peer_port_be = ep.port;
+    return (int)conn;
+}
+
+static int vclpoll_read(int vlsh, void *buf, size_t n) {
+    return (int)vls_read((vls_handle_t)vlsh, buf, n);
+}
+
+static int vclpoll_write(int vlsh, const void *buf, size_t n) {
+    return vls_write((vls_handle_t)vlsh, (void *)buf, n);
+}
+
+static int vclpoll_close(int vlsh) {
+    return vls_close((vls_handle_t)vlsh);
+}
+
+// vls_shutdown wrapper. how is a POSIX shutdown constant:
+//   SHUT_RD  (0): stop reading  (VCL_SESSION_F_RD_SHUTDOWN — reads return 0/EOF once drained)
+//   SHUT_WR  (1): stop writing  (VCL_SESSION_F_WR_SHUTDOWN — writes return VPPCOM_EPIPE;
+//                                VPP sends the shutdown message to the peer)
+//   SHUT_RDWR(2): stop both
+// Listeners cannot be shutdown (returns VPPCOM_EBADFD).
+static int vclpoll_shutdown(int vlsh, int how) {
+    return vls_shutdown((vls_handle_t)vlsh, how);
+}
+
+// --- Native VCL TLS (VPPCOM_PROTO_TLS) ---
+//
+// VPP owns the TLS state machine when a session is created with
+// VPPCOM_PROTO_TLS. The application registers a cert/key pair once with
+// vppcom_add_cert_key_pair (returns a process-global index) and then binds
+// that index to each TLS session via vppcom_session_attr(SET_CKPAIR) before
+// bind/listen or connect.
+//
+// The engine (OpenSSL / picotls) is chosen by the vpp-side plugin set and the
+// `tls-engine <N>` token in vcl.conf; vclnet does not currently expose engine
+// selection here.
+
+// Register a cert/key pair with VPP. cert and key are raw byte buffers
+// (typically PEM). On success *out_index receives the ckpair index and the
+// function returns 0. On failure it returns a negative vppcom errno.
+static int vclpoll_add_cert_key_pair(const uint8_t *cert, uint32_t cert_len,
+                                     const uint8_t *key, uint32_t key_len,
+                                     uint32_t *out_index) {
+    vppcom_cert_key_pair_t ckpair;
+    memset(&ckpair, 0, sizeof ckpair);
+    ckpair.cert     = (char *)cert;
+    ckpair.key      = (char *)key;
+    ckpair.cert_len = cert_len;
+    ckpair.key_len  = key_len;
+    int rv = vppcom_add_cert_key_pair(&ckpair);
+    if (rv < 0) {
+        return rv;
+    }
+    if (out_index) *out_index = (uint32_t)rv;
+    return 0;
+}
+
+// Release a previously registered cert/key pair.
+static int vclpoll_del_cert_key_pair(uint32_t ckp_index) {
+    return vppcom_del_cert_key_pair(ckp_index);
+}
+
+// Create a non-blocking TLS listener bound to IPv4 addr:port with the given
+// cert/key index. The full sequence is
+//   vls_create(PROTO_TLS)  ->  vls_attr(SET_REUSEPORT)  ->  vls_attr(SET_CKPAIR)  ->  vls_bind  ->  vls_listen
+// and any failure closes the vlsh before returning the errno. This matches
+// vperf's server-side TLS setup.
+static int vclpoll_listen_tls4_nb(uint32_t ip4_be, uint16_t port_be,
+                                  int backlog, uint32_t ckp_index) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) return (int)vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
+
+    uint32_t ckp_len = sizeof(ckp_index);
+    int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, backlog);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Create a non-blocking TLS listener bound to an IPv6 address + port.
+static int vclpoll_listen_tls6_nb(const uint8_t ip6[16], uint16_t port_be,
+                                  int backlog, uint32_t ckp_index) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) return (int)vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
+
+    uint32_t ckp_len = sizeof(ckp_index);
+    int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, backlog);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Start a non-blocking TLS connect to an IPv4 endpoint. If ckp_index_valid is
+// nonzero, the caller-supplied ckpair is attached before connect (needed for
+// mTLS or when the server enforces a client cert). When ckp_index_valid is
+// zero the client relies on VPP's default (ckpair index 0), matching
+// anonymous TLS clients.
+// Returns:
+//   >=0  immediate connect (rare on TLS since the handshake needs RTTs),
+//   -EINPROGRESS  handshake pending; caller must wait for EPOLLOUT,
+//   <0   hard failure.
+// On any negative return, *out_vlsh is set (if valid) so the caller can close.
+static int vclpoll_connect_tls4_start(uint32_t ip4_be, uint16_t port_be,
+                                      uint32_t ckp_index, int ckp_index_valid,
+                                      int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    if (ckp_index_valid) {
+        uint32_t ckp_len = sizeof(ckp_index);
+        int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+        if (rv < 0) return rv;
+    }
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Start a non-blocking TLS connect to an IPv6 endpoint. See tls4_start.
+static int vclpoll_connect_tls6_start(const uint8_t ip6[16], uint16_t port_be,
+                                      uint32_t ckp_index, int ckp_index_valid,
+                                      int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    if (ckp_index_valid) {
+        uint32_t ckp_len = sizeof(ckp_index);
+        int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+        if (rv < 0) return rv;
+    }
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Wait for a session to become readable / writable using a one-shot
+// vls_epoll_create + ctl + wait + close. timeout_s: seconds (negative = infinite).
+// events: bitmask of EPOLLIN/EPOLLOUT etc.
+//
+// Returns: 1 if event ready, 0 on timeout, <0 on error.
+static int vclpoll_wait_once(int vlsh, uint32_t events, double timeout_s) {
+    vls_handle_t ep = vls_epoll_create();
+    if (ep < 0) return (int)ep;
+
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events  = events;
+    ev.data.u64 = (uint64_t)vlsh;
+
+    int rv = vls_epoll_ctl(ep, EPOLL_CTL_ADD, (vls_handle_t)vlsh, &ev);
+    if (rv < 0) { vls_close(ep); return rv; }
+
+    struct epoll_event out;
+    int n = vls_epoll_wait(ep, &out, 1, timeout_s);
+    int saved = (n < 0) ? n : ((n == 0) ? 0 : 1);
+
+    vls_close(ep);
+    return saved;
+}
+
+// --- IPv6 support ---
+
+// Create a non-blocking TCP listener bound to an IPv6 address + port (BE).
+static int vclpoll_listen_tcp6_nb(const uint8_t ip6[16], uint16_t port_be,
+                                  int backlog) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
+    if (vlsh < 0) return vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    int rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, backlog);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Create a non-blocking TCP socket and connect to an IPv6 address + port.
+static int vclpoll_connect_tcp6_nb(const uint8_t ip6[16], uint16_t port_be,
+                                   int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Non-blocking accept returning full address info (IPv4 or IPv6).
+// peer_ip must be at least 16 bytes. is_ip4 is set to 1 for IPv4, 0 for IPv6.
+static int vclpoll_accept_nb_full(int listener_vlsh,
+                                  uint8_t *peer_ip, uint16_t *peer_port_be,
+                                  int *is_ip4) {
+    uint8_t ip[16] = {0};
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.ip = ip;
+
+    vls_handle_t conn = vls_accept((vls_handle_t)listener_vlsh, &ep,
+                                   O_NONBLOCK);
+    if (conn < 0) return (int)conn;
+
+    if (peer_ip) memcpy(peer_ip, ip, 16);
+    if (peer_port_be) *peer_port_be = ep.port;
+    if (is_ip4) *is_ip4 = (ep.is_ip4 == VPPCOM_IS_IP4) ? 1 : 0;
+    return (int)conn;
+}
+
+// --- Address query via vls_attr ---
+
+// Get the local address of a session. ip must be >= 16 bytes.
+// Returns 0 on success, <0 on error.
+static int vclpoll_get_local_addr(int vlsh, uint8_t *ip, uint16_t *port_be,
+                                  int *is_ip4) {
+    uint8_t buf[16] = {0};
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.ip = buf;
+
+    uint32_t buflen = sizeof(ep);
+    int rv = vls_attr((vls_handle_t)vlsh, VPPCOM_ATTR_GET_LCL_ADDR,
+                      &ep, &buflen);
+    if (rv < 0) return rv;
+
+    if (ip) memcpy(ip, buf, 16);
+    if (port_be) *port_be = ep.port;
+    if (is_ip4) *is_ip4 = (ep.is_ip4 == VPPCOM_IS_IP4) ? 1 : 0;
+    return 0;
+}
+
+// Get the peer address of a session. ip must be >= 16 bytes.
+// Returns 0 on success, <0 on error.
+static int vclpoll_get_peer_addr(int vlsh, uint8_t *ip, uint16_t *port_be,
+                                 int *is_ip4) {
+    uint8_t buf[16] = {0};
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.ip = buf;
+
+    uint32_t buflen = sizeof(ep);
+    int rv = vls_attr((vls_handle_t)vlsh, VPPCOM_ATTR_GET_PEER_ADDR,
+                      &ep, &buflen);
+    if (rv < 0) return rv;
+
+    if (ip) memcpy(ip, buf, 16);
+    if (port_be) *port_be = ep.port;
+    if (is_ip4) *is_ip4 = (ep.is_ip4 == VPPCOM_IS_IP4) ? 1 : 0;
+    return 0;
+}
+
+// Set IPV6_V6ONLY on a VLS session. value: 1=v6only, 0=dual-stack.
+static int vclpoll_set_v6only(int vlsh, int value) {
+    uint32_t buflen = sizeof(value);
+    return vls_attr((vls_handle_t)vlsh, VPPCOM_ATTR_SET_V6ONLY,
+                    &value, &buflen);
+}
+
+// Query the session-scoped connect error via VPP's dedicated call. Unlike
+// VPPCOM_ATTR_GET_ERROR (which is a stub returning 0 in the pinned build),
+// vppcom_session_get_error inspects vcl_session_t::vpp_error, which the
+// SESSION_CTRL_EVT_CONNECTED handler populates when the peer rejects the
+// connect (SESSION_E_REFUSED → VPPCOM_ECONNREFUSED, SESSION_E_PORTINUSE →
+// VPPCOM_EADDRINUSE, any other non-zero session error → VPPCOM_EFAULT).
+//
+// Returns 0 if the connect succeeded (session ready), or a negative VPPCOM
+// errno describing the failure. Must be called after EPOLLOUT/EPOLLERR
+// fires — before the SESSION_CTRL_EVT_CONNECTED handler runs, vpp_error is
+// still SESSION_E_NONE.
+static int vclpoll_session_get_connect_error(int vlsh) {
+    vcl_session_handle_t sh = vlsh_to_sh((vls_handle_t)vlsh);
+    if (sh == (vcl_session_handle_t)-1) {
+        return -EBADF;
+    }
+    return vppcom_session_get_error((uint32_t)sh);
+}
+
+// --- UDP support ---
+
+// Create a non-blocking UDP socket bound to an IPv4 address + port.
+// Calls vls_listen after bind so VPP's session layer routes incoming
+// datagrams to this socket (VPP UDP requires listen for server-side reception).
+static int vclpoll_bind_udp4_nb(uint32_t ip4_be, uint16_t port_be) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_UDP, 1);
+    if (vlsh < 0) return vlsh;
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    int rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, 1);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Create a non-blocking UDP socket bound to an IPv6 address + port.
+static int vclpoll_bind_udp6_nb(const uint8_t ip6[16], uint16_t port_be) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_UDP, 1);
+    if (vlsh < 0) return vlsh;
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    int rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, 1);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Create a non-blocking UDP socket and connect to an IPv4 address + port.
+static int vclpoll_connect_udp4_nb(uint32_t ip4_be, uint16_t port_be,
+                                   int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_UDP, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Create a non-blocking UDP socket and connect to an IPv6 address + port.
+static int vclpoll_connect_udp6_nb(const uint8_t ip6[16], uint16_t port_be,
+                                   int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_UDP, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Send a UDP datagram to a specific destination.
+static int vclpoll_sendto(int vlsh, const void *buf, size_t n,
+                          int is_ip4, const uint8_t *ip, uint16_t port_be) {
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = is_ip4 ? VPPCOM_IS_IP4 : VPPCOM_IS_IP6;
+    ep.ip     = (uint8_t *)ip;
+    ep.port   = port_be;
+
+    return vls_sendto((vls_handle_t)vlsh, (void *)buf, n, 0, &ep);
+}
+
+// Receive a UDP datagram and populate the sender's address.
+static int vclpoll_recvfrom(int vlsh, void *buf, size_t n,
+                            uint8_t *peer_ip, uint16_t *peer_port_be,
+                            int *is_ip4) {
+    uint8_t ip[16] = {0};
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.ip = ip;
+
+    int rv = vls_recvfrom((vls_handle_t)vlsh, buf, n, 0, &ep);
+    if (rv < 0) return rv;
+
+    if (peer_ip) memcpy(peer_ip, ip, 16);
+    if (peer_port_be) *peer_port_be = ep.port;
+    if (is_ip4) *is_ip4 = (ep.is_ip4 == VPPCOM_IS_IP4) ? 1 : 0;
+    return rv;
+}
+
+// --- Split connect (for context-aware dial) ---
+
+// Initiate a non-blocking TCP4 connect without waiting.
+// Returns the vlsh via out_vlsh.
+// Return value: >=0 immediate connect, -EINPROGRESS = in flight, <0 hard error.
+static int vclpoll_connect_tcp4_start(uint32_t ip4_be, uint16_t port_be,
+                                      int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Initiate a non-blocking TCP6 connect without waiting.
+static int vclpoll_connect_tcp6_start(const uint8_t ip6[16], uint16_t port_be,
+                                      int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// --- Shared poller primitives ---
+
+static int vclpoll_epoll_create(void) {
+    return (int)vls_epoll_create();
+}
+
+static int vclpoll_epoll_ctl(int ep_vlsh, int op, int vlsh,
+                             struct epoll_event *ev) {
+    return vls_epoll_ctl((vls_handle_t)ep_vlsh, op,
+                         (vls_handle_t)vlsh, ev);
+}
+
+static int vclpoll_epoll_wait(int ep_vlsh, struct epoll_event *events,
+                              int maxevents, double timeout_s) {
+    return vls_epoll_wait((vls_handle_t)ep_vlsh, events, maxevents, timeout_s);
+}
+*/
+import "C"
+
+import (
+	"errors"
+	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"unsafe"
+)
+
+// VLSH is a VCL Locked Session handle. It does not leave this package's
+// callers as a Go file descriptor — vclnet wraps it.
+type VLSH int32
+
+const invalidVLSH VLSH = -1
+
+const (
+	// epoll event bits (must match Linux <sys/epoll.h>; VLS uses these as-is).
+	epollIn    = 0x001
+	epollOut   = 0x004
+	epollErr   = 0x008
+	epollHup   = 0x010
+	epollRDHup = 0x2000
+)
+
+var (
+	appOnce    sync.Once
+	appErr     error
+	appCreated atomic.Bool
+	appLive    atomic.Bool
+
+	workerRegistry sync.Map // pthread id (uintptr) -> struct{}
+
+	// vlsMu serializes worker registration and app create/destroy against
+	// every other VLS call. libvppcom's vls_register_vcl_worker is empirically
+	// not safe against a concurrent vls_* call on another thread (it mutates
+	// the shared worker vec while vls_epoll_wait dereferences per-worker
+	// state, producing SIGSEGV inside libvppcom). Registration and lifecycle
+	// operations take the write lock (rare); every other VLS call takes the
+	// read lock (cheap, allows concurrency).
+	vlsMu sync.RWMutex
+)
+
+// mode3AppInit performs one-time shared-worker VLS registration. The OS thread
+// that creates the application becomes worker 0 and is recorded as registered.
+func mode3AppInit(appName string) error {
+	appOnce.Do(func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+
+		vlsMu.Lock()
+		defer vlsMu.Unlock()
+
+		cname := C.CString(appName)
+		defer C.free(unsafe.Pointer(cname))
+		rv := C.vclpoll_app_create(cname)
+		if rv != 0 {
+			appErr = fmt.Errorf("vls_app_create failed: rv=%d", int(rv))
+			return
+		}
+		workerRegistry.Store(uintptr(C.vclpoll_pthread_self()), struct{}{})
+		appCreated.Store(true)
+		appLive.Store(true)
+	})
+	return appErr
+}
+
+// registerThisThread ensures the current OS thread is registered as a VCL
+// worker. Must be called with runtime.LockOSThread() held. Registration is
+// serialized under vlsMu.Lock() so it cannot race a concurrent vls_* call
+// on another thread. Uses double-checked locking so the fast path (already
+// registered) is a single sync.Map load.
+func registerThisThread() {
+	tid := uintptr(C.vclpoll_pthread_self())
+	if _, ok := workerRegistry.Load(tid); ok {
+		return
+	}
+	vlsMu.Lock()
+	defer vlsMu.Unlock()
+	if _, ok := workerRegistry.Load(tid); ok {
+		return
+	}
+	C.vclpoll_register_worker()
+	workerRegistry.Store(tid, struct{}{})
+}
+
+// enterVLS pins the calling goroutine to its current OS thread, registers
+// that thread as a VCL worker (if needed), and acquires the VLS shared read
+// lock. Must be paired with exitVLS(). The read lock lets many VLS calls
+// proceed concurrently while blocking only rare worker registrations and
+// app lifecycle operations.
+// markCurrentThreadRegistered records a thread whose VCL worker was created by
+// the mode-2 bootstrap path. It prevents one-shot helpers reused by a worker
+// loop from registering a second VCL worker on the same pthread.
+func markCurrentThreadRegistered() {
+	workerRegistry.Store(uintptr(C.vclpoll_pthread_self()), struct{}{})
+}
+
+func enterVLS() {
+	runtime.LockOSThread()
+	registerThisThread()
+	vlsMu.RLock()
+}
+
+// exitVLS releases the VLS shared read lock and unpins the calling goroutine.
+func exitVLS() {
+	vlsMu.RUnlock()
+	runtime.UnlockOSThread()
+}
+
+// pin is a defer-friendly wrapper around enterVLS/exitVLS for one-shot VLS
+// calls. Callers MUST defer the returned unpin function:
+//
+//	defer pin()()
+func pin() func() {
+	enterVLS()
+	return exitVLS
+}
+
+// --- Shared poller bridge functions (used by poller.go) ---
+
+// pollEvent holds one event returned by pollerEpollWait.
+type pollEvent struct {
+	Vlsh   VLSH
+	Events uint32
+}
+
+// pollerEpollCreate creates a persistent vls_epoll handle. The poller's OS
+// thread must already be registered (poller.loop() calls registerThisThread
+// before this). We take the shared read lock so this CGo call cannot race a
+// concurrent vls_register_vcl_worker on another thread.
+func pollerEpollCreate() (VLSH, error) {
+	vlsMu.RLock()
+	rv := C.vclpoll_epoll_create()
+	vlsMu.RUnlock()
+	if rv < 0 {
+		return invalidVLSH, vppErr("epoll_create", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+// pollerEpollCtlAdd adds a session to the poller's epoll instance.
+func pollerEpollCtlAdd(epVLSH, vlsh VLSH, events uint32) error {
+	var ev C.struct_epoll_event
+	C.memset(unsafe.Pointer(&ev), 0, C.sizeof_struct_epoll_event)
+	ev.events = C.uint32_t(events)
+	*(*C.uint64_t)(unsafe.Pointer(&ev.data[0])) = C.uint64_t(vlsh)
+	vlsMu.RLock()
+	rv := C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_ADD, C.int(vlsh), &ev)
+	vlsMu.RUnlock()
+	if rv < 0 {
+		return vppErr("epoll_ctl_add", int(rv))
+	}
+	return nil
+}
+
+// pollerEpollCtlMod updates the event mask for an existing session.
+func pollerEpollCtlMod(epVLSH, vlsh VLSH, events uint32) error {
+	var ev C.struct_epoll_event
+	C.memset(unsafe.Pointer(&ev), 0, C.sizeof_struct_epoll_event)
+	ev.events = C.uint32_t(events)
+	*(*C.uint64_t)(unsafe.Pointer(&ev.data[0])) = C.uint64_t(vlsh)
+	vlsMu.RLock()
+	rv := C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_MOD, C.int(vlsh), &ev)
+	vlsMu.RUnlock()
+	if rv < 0 {
+		return vppErr("epoll_ctl_mod", int(rv))
+	}
+	return nil
+}
+
+// pollerEpollCtlDel removes a session from the poller's epoll instance.
+func pollerEpollCtlDel(epVLSH, vlsh VLSH) {
+	vlsMu.RLock()
+	C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_DEL, C.int(vlsh), nil)
+	vlsMu.RUnlock()
+}
+
+// pollerEpollWait calls vls_epoll_wait on the poller's handle.
+// Returns the number of ready events written to buf. The read lock is held
+// for the duration of the CGo call so vls_register_vcl_worker cannot mutate
+// VLS internal state under our feet. The 100ms timeout bounds how long a
+// waiting registrator has to sit behind us.
+func pollerEpollWait(epVLSH VLSH, buf []pollEvent) int {
+	if len(buf) == 0 {
+		return 0
+	}
+	maxEv := len(buf)
+	if maxEv > 64 {
+		maxEv = 64
+	}
+	var events [64]C.struct_epoll_event
+	vlsMu.RLock()
+	n := C.vclpoll_epoll_wait(C.int(epVLSH), &events[0], C.int(maxEv), 0.1)
+	vlsMu.RUnlock()
+	if n <= 0 {
+		return 0
+	}
+	for i := 0; i < int(n); i++ {
+		buf[i] = pollEvent{
+			Vlsh:   VLSH(*(*C.uint64_t)(unsafe.Pointer(&events[i].data[0]))),
+			Events: uint32(events[i].events),
+		}
+	}
+	return int(n)
+}
+
+func ipBE(ip4 [4]byte) uint32 {
+	return uint32(ip4[0]) | uint32(ip4[1])<<8 | uint32(ip4[2])<<16 | uint32(ip4[3])<<24
+}
+
+func portBE(p uint16) uint16 { return uint16(p>>8) | uint16(p&0xff)<<8 }
+
+// ListenTCP4 creates a non-blocking TCP listener bound to ip4:port.
+func mode3ListenTCP4(ip4 [4]byte, port uint16, backlog int) (VLSH, error) {
+	defer pin()()
+	rv := C.vclpoll_listen_tcp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)),
+		C.int(backlog))
+	if rv < 0 {
+		return invalidVLSH, vppErr("listen_tcp4", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+// finishBlockingConnect handles the common post-C-connect logic for legacy
+// blocking dial helpers: if the connect returned EINPROGRESS/EAGAIN it waits
+// for EPOLLOUT via a temp-epoll within timeoutSec; on hard error it cleans
+// up the vlsh. op is used for error messages.
+func finishBlockingConnect(rv C.int, outVLSH C.int, op string, timeoutSec float64) (VLSH, error) {
+	vlsh := VLSH(outVLSH)
+	if rv >= 0 {
+		return vlsh, nil
+	}
+	if !isInProgress(int(rv)) && !isAgain(int(rv)) {
+		if vlsh >= 0 {
+			C.vclpoll_close(C.int(vlsh))
+		}
+		return invalidVLSH, vppErr(op, int(rv))
+	}
+	w := C.vclpoll_wait_once(C.int(vlsh), epollOut, C.double(timeoutSec))
+	if w < 0 {
+		C.vclpoll_close(C.int(vlsh))
+		return invalidVLSH, vppErr(op+"_wait", int(w))
+	}
+	if w == 0 {
+		C.vclpoll_close(C.int(vlsh))
+		return invalidVLSH, vppErr(op+"_timeout", -int(syscall.ETIMEDOUT))
+	}
+	return vlsh, nil
+}
+
+func mode3DialTCP4(ip4 [4]byte, port uint16) (VLSH, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_tcp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)), &outVLSH)
+	return finishBlockingConnect(rv, outVLSH, "connect", 30.0)
+}
+
+// Accept blocks until a new connection arrives. Returns the new conn's VLSH
+// and the peer's IPv4 + port (host order).
+func mode3Accept(listener VLSH) (VLSH, [4]byte, uint16, error) {
+	enterVLS()
+
+	for {
+		if !appLive.Load() {
+			exitVLS()
+			return invalidVLSH, [4]byte{}, 0, ErrClosed
+		}
+		var peerIP4 C.uint32_t
+		var peerPort C.uint16_t
+		rv := C.vclpoll_accept_nb(C.int(listener), &peerIP4, &peerPort)
+		if rv >= 0 {
+			exitVLS()
+			be := uint32(peerIP4)
+			ip := [4]byte{byte(be), byte(be >> 8), byte(be >> 16), byte(be >> 24)}
+			pBE := uint16(peerPort)
+			port := uint16(pBE>>8) | uint16(pBE&0xff)<<8
+			return VLSH(rv), ip, port, nil
+		}
+		if !isAgain(int(rv)) {
+			exitVLS()
+			return invalidVLSH, [4]byte{}, 0, vppErr("accept", int(rv))
+		}
+		exitVLS()
+		pollWait(listener, epollIn)
+		enterVLS()
+	}
+}
+
+// mode3Read reads up to len(p) bytes and uses the Mode 3 poller on EAGAIN.
+func mode3Read(vlsh VLSH, p []byte) (int, error) {
+	return mode3ReadContext(vlsh, p, nil)
+}
+
+// ReadContext is Read with a cancellation signal for the readiness wait.
+func mode3ReadContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	enterVLS()
+
+	for {
+		if !appLive.Load() {
+			exitVLS()
+			return 0, ErrClosed
+		}
+		rv := C.vclpoll_read(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
+		if rv >= 0 {
+			exitVLS()
+			return int(rv), nil
+		}
+		if !isAgain(int(rv)) {
+			exitVLS()
+			return 0, vppErr("read", int(rv))
+		}
+		exitVLS()
+		if !mode3PollWaitContext(vlsh, epollIn, doneCh) {
+			return 0, ErrWaitCanceled
+		}
+		enterVLS()
+	}
+}
+
+// mode3Write writes up to len(p) bytes and uses the Mode 3 poller on EAGAIN.
+func mode3Write(vlsh VLSH, p []byte) (int, error) {
+	return mode3WriteContext(vlsh, p, nil)
+}
+
+// WriteContext is Write with a cancellation signal for the readiness wait.
+func mode3WriteContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	enterVLS()
+
+	for {
+		if !appLive.Load() {
+			exitVLS()
+			return 0, ErrClosed
+		}
+		rv := C.vclpoll_write(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
+		if rv >= 0 {
+			exitVLS()
+			return int(rv), nil
+		}
+		if !isAgain(int(rv)) {
+			exitVLS()
+			return 0, vppErr("write", int(rv))
+		}
+		exitVLS()
+		if !mode3PollWaitContext(vlsh, epollOut, doneCh) {
+			return 0, ErrWaitCanceled
+		}
+		enterVLS()
+	}
+}
+
+// Close releases the session.
+func mode3Close(vlsh VLSH) error {
+	pollUnregister(vlsh)
+	defer pin()()
+	rv := C.vclpoll_close(C.int(vlsh))
+	if rv < 0 {
+		return vppErr("close", int(rv))
+	}
+	return nil
+}
+
+// mode3Shutdown issues vls_shutdown for the calling app thread. It pins the
+// current goroutine so the CGo call runs against a registered VCL worker.
+// Unlike Close, we do NOT unregister the vlsh from the shared poller — the
+// session is still alive; the peer or subsequent Close is expected to reap
+// the underlying poller state. Callers must wake any parked reader/writer.
+func mode3Shutdown(vlsh VLSH, how int) error {
+	defer pin()()
+	return rawShutdown(vlsh, how)
+}
+
+// mode3SessionConnectError queries VPP for an async connect result. Pins
+// the goroutine so the vppcom_session_get_error CGo call runs against a
+// registered VCL worker.
+func mode3SessionConnectError(vlsh VLSH) error {
+	defer pin()()
+	return rawSessionConnectError(vlsh)
+}
+
+func isAgain(rv int) bool {
+	return rv == -int(syscall.EAGAIN) || rv == -int(syscall.EWOULDBLOCK)
+}
+
+func isInProgress(rv int) bool { return rv == -int(syscall.EINPROGRESS) }
+
+// VCLError represents an error returned by the VCL/VLS layer.
+// It wraps a syscall.Errno so callers can use errors.Is(err, syscall.ECONNREFUSED) etc.
+type VCLError struct {
+	Op    string
+	Errno syscall.Errno
+}
+
+func (e *VCLError) Error() string {
+	return fmt.Sprintf("vclpoll: %s: %s", e.Op, e.Errno.Error())
+}
+
+func (e *VCLError) Unwrap() error {
+	return e.Errno
+}
+
+func (e *VCLError) Is(target error) bool {
+	if t, ok := target.(syscall.Errno); ok {
+		return e.Errno == t
+	}
+	return false
+}
+
+func (e *VCLError) Timeout() bool {
+	return e.Errno == syscall.ETIMEDOUT
+}
+
+func (e *VCLError) Temporary() bool {
+	return e.Errno == syscall.EAGAIN || e.Errno == syscall.EWOULDBLOCK || e.Errno == syscall.EINTR
+}
+
+func vppErr(op string, rv int) error {
+	if rv >= 0 {
+		return nil
+	}
+	return &VCLError{Op: op, Errno: syscall.Errno(-rv)}
+}
+
+// ErrClosed reports that the VCL application or session is closed.
+var ErrClosed = errors.New("vclpoll: session closed")
+
+// ErrWaitCanceled reports that a readiness wait was interrupted.
+var ErrWaitCanceled = errors.New("vclpoll: readiness wait canceled")
+
+// --- IPv6 support ---
+
+// ListenTCP6 creates a non-blocking TCP listener bound to an IPv6 address.
+func mode3ListenTCP6(ip6 [16]byte, port uint16, backlog int) (VLSH, error) {
+	defer pin()()
+
+	rv := C.vclpoll_listen_tcp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)),
+		C.int(backlog))
+	if rv < 0 {
+		return invalidVLSH, vppErr("listen_tcp6", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+func mode3DialTCP6(ip6 [16]byte, port uint16) (VLSH, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_tcp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)), &outVLSH)
+	return finishBlockingConnect(rv, outVLSH, "connect6", 30.0)
+}
+
+// AddrInfo holds an IP address (v4 or v6) and port returned from VLS.
+type AddrInfo struct {
+	IP   [16]byte
+	Port uint16
+	IsV4 bool
+}
+
+// These helpers perform exactly one VLS operation on the current OS thread.
+// They do not pin or register the thread; mode 2 calls them only from a
+// permanently pinned worker.
+func rawAppCreate(appName string) error {
+	cname := C.CString(appName)
+	defer C.free(unsafe.Pointer(cname))
+	if rv := C.vclpoll_app_create(cname); rv != 0 {
+		return fmt.Errorf("vls_app_create failed: rv=%d", int(rv))
+	}
+	return nil
+}
+
+func rawAppDestroy() { C.vclpoll_app_destroy() }
+
+func rawRegisterWorker() error {
+	C.vclpoll_register_worker()
+	if rawWorkerIndex() == ^uint32(0) {
+		return errors.New("vclpoll: VCL worker registration failed")
+	}
+	return nil
+}
+
+// rawUnregisterWorker performs a full VLS-level teardown of the calling
+// thread's worker: pthread-key clear, VLS bookkeeping, lock release, and
+// VCL worker unregister. It must run on the same pinned OS thread that
+// called rawRegisterWorker. Returns an error if the pthread-key could
+// not be cleared (no state is modified in that case).
+func rawUnregisterWorker() error {
+	if C.vclpoll_worker_unregister() != 0 {
+		return vppErr("worker_unregister", -1)
+	}
+	return nil
+}
+
+func rawWorkerIndex() uint32 { return uint32(C.vclpoll_worker_index()) }
+func rawMode2Enabled() bool  { return C.vclpoll_mode2_enabled() != 0 }
+
+func rawSessionWorker(vlsh VLSH) (uint32, bool) {
+	var sessionIndex C.uint32_t
+	var workerIndex C.uint32_t
+	C.vclpoll_session_worker(C.int(vlsh), &sessionIndex, &workerIndex)
+	worker := uint32(workerIndex)
+	return worker, worker != ^uint32(0) && uint32(sessionIndex) != ^uint32(0)
+}
+
+func rawAcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
+	var peerIP [16]C.uint8_t
+	var peerPort C.uint16_t
+	var isIP4 C.int
+	rv := C.vclpoll_accept_nb_full(C.int(listener), &peerIP[0], &peerPort, &isIP4)
+	if rv < 0 {
+		return invalidVLSH, AddrInfo{}, vppErr("accept", int(rv))
+	}
+	return VLSH(rv), addrInfoFromC(peerIP, peerPort, isIP4), nil
+}
+
+func rawRead(vlsh VLSH, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	rv := C.vclpoll_read(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
+	if rv < 0 {
+		return 0, vppErr("read", int(rv))
+	}
+	return int(rv), nil
+}
+
+func rawWrite(vlsh VLSH, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	rv := C.vclpoll_write(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
+	if rv < 0 {
+		return 0, vppErr("write", int(rv))
+	}
+	return int(rv), nil
+}
+
+func rawClose(vlsh VLSH) error {
+	if rv := C.vclpoll_close(C.int(vlsh)); rv < 0 {
+		return vppErr("close", int(rv))
+	}
+	return nil
+}
+
+// rawShutdown issues vls_shutdown for the caller on its current, pinned OS
+// thread. The mode-2 worker uses this from inside its loop; the mode-3 path
+// wraps it with pin().
+func rawShutdown(vlsh VLSH, how int) error {
+	if rv := C.vclpoll_shutdown(C.int(vlsh), C.int(how)); rv < 0 {
+		return vppErr("shutdown", int(rv))
+	}
+	return nil
+}
+
+// rawSessionConnectError queries VPP for the connect result of an
+// asynchronously-connected session. Callers MUST issue this after the
+// readiness wait wakes them (EPOLLOUT / EPOLLERR / EPOLLHUP) so VPP has
+// already delivered SESSION_CTRL_EVT_CONNECTED and populated
+// vcl_session_t::vpp_error. A return of nil means the connect succeeded
+// and the session is ready for I/O; a non-nil *VCLError carries a
+// syscall.Errno translated from vppcom_session_get_error's negative
+// VPPCOM_E* result (ECONNREFUSED, EADDRINUSE, EFAULT for other errors,
+// or EBADFD if the handle no longer resolves).
+//
+// Not concurrency-safe with parallel Close on the same vlsh; the dispatcher
+// wraps this with the same pin/owner-submit discipline as other VLS calls.
+func rawSessionConnectError(vlsh VLSH) error {
+	rv := C.vclpoll_session_get_connect_error(C.int(vlsh))
+	if rv >= 0 {
+		return nil
+	}
+	return vppErr("connect", int(rv))
+}
+
+// rawAddCertKeyPair registers a PEM cert+key pair with VPP and returns the
+// process-global ckpair index. The CGo call runs on the calling OS thread;
+// callers in mode-3 must have pinned themselves already, and mode-2 must
+// submit this to a worker so registration serialises with other VLS calls
+// against the shared registry.
+func rawAddCertKeyPair(cert, key []byte) (uint32, error) {
+	if len(cert) == 0 || len(key) == 0 {
+		return 0, syscall.EINVAL
+	}
+	var idx C.uint32_t
+	rv := C.vclpoll_add_cert_key_pair(
+		(*C.uint8_t)(unsafe.Pointer(&cert[0])), C.uint32_t(len(cert)),
+		(*C.uint8_t)(unsafe.Pointer(&key[0])), C.uint32_t(len(key)),
+		&idx)
+	if rv < 0 {
+		return 0, vppErr("add_cert_key_pair", int(rv))
+	}
+	return uint32(idx), nil
+}
+
+// rawDelCertKeyPair releases a previously registered ckpair. Safe to call
+// even if VPP has already torn down the entry (returns EINVAL, which we
+// forward — teardown paths typically ignore the error).
+func rawDelCertKeyPair(idx uint32) error {
+	rv := C.vclpoll_del_cert_key_pair(C.uint32_t(idx))
+	if rv < 0 {
+		return vppErr("del_cert_key_pair", int(rv))
+	}
+	return nil
+}
+
+// rawListenTLS4 creates a non-blocking TLS listener bound to ip4:port with
+// the given ckpair attached.
+func rawListenTLS4(ip4 [4]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	rv := C.vclpoll_listen_tls4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)),
+		C.int(backlog), C.uint32_t(ckp))
+	if rv < 0 {
+		return invalidVLSH, vppErr("listen_tls4", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+// rawListenTLS6 creates a non-blocking TLS listener bound to ip6:port with
+// the given ckpair attached.
+func rawListenTLS6(ip6 [16]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	rv := C.vclpoll_listen_tls6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)),
+		C.int(backlog), C.uint32_t(ckp))
+	if rv < 0 {
+		return invalidVLSH, vppErr("listen_tls6", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+// parseConnectResult interprets the return value of a non-blocking connect
+// C call. All connect-start variants (TCP, UDP, TLS) share this exact
+// three-way dispatch: immediate success, EINPROGRESS/EAGAIN, or hard error.
+func parseConnectResult(rv C.int, outVLSH C.int, op string) (VLSH, bool, error) {
+	vlsh := VLSH(outVLSH)
+	if rv >= 0 {
+		return vlsh, true, nil
+	}
+	if isInProgress(int(rv)) || isAgain(int(rv)) {
+		return vlsh, false, nil
+	}
+	if vlsh >= 0 {
+		C.vclpoll_close(C.int(vlsh))
+	}
+	return invalidVLSH, false, vppErr(op, int(rv))
+}
+
+func rawConnectTLS4Start(ip4 [4]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	var outVLSH C.int = -1
+	valid := C.int(0)
+	if ckpValid {
+		valid = 1
+	}
+	rv := C.vclpoll_connect_tls4_start(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)),
+		C.uint32_t(ckp), valid, &outVLSH)
+	return parseConnectResult(rv, outVLSH, "connect_tls4_start")
+}
+
+func rawConnectTLS6Start(ip6 [16]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	var outVLSH C.int = -1
+	valid := C.int(0)
+	if ckpValid {
+		valid = 1
+	}
+	rv := C.vclpoll_connect_tls6_start((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)),
+		C.uint32_t(ckp), valid, &outVLSH)
+	return parseConnectResult(rv, outVLSH, "connect_tls6_start")
+}
+
+// mode3AddCertKeyPair wraps rawAddCertKeyPair with pin() so registration
+// runs against a registered VCL worker and cannot race worker registration
+// on another thread.
+func mode3AddCertKeyPair(cert, key []byte) (uint32, error) {
+	defer pin()()
+	return rawAddCertKeyPair(cert, key)
+}
+
+func mode3DelCertKeyPair(idx uint32) error {
+	defer pin()()
+	return rawDelCertKeyPair(idx)
+}
+
+func mode3ListenTLS4(ip4 [4]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	defer pin()()
+	return rawListenTLS4(ip4, port, backlog, ckp)
+}
+
+func mode3ListenTLS6(ip6 [16]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	defer pin()()
+	return rawListenTLS6(ip6, port, backlog, ckp)
+}
+
+func mode3ConnectTLS4Start(ip4 [4]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	defer pin()()
+	return rawConnectTLS4Start(ip4, port, ckp, ckpValid)
+}
+
+func mode3ConnectTLS6Start(ip6 [16]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	defer pin()()
+	return rawConnectTLS6Start(ip6, port, ckp, ckpValid)
+}
+
+func rawSendTo(vlsh VLSH, p []byte, addr AddrInfo) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	ip := addr.IP
+	isIP4 := 0
+	if addr.IsV4 {
+		isIP4 = 1
+	}
+	rv := C.vclpoll_sendto(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)),
+		C.int(isIP4), (*C.uint8_t)(&ip[0]), C.uint16_t(portBE(addr.Port)))
+	if rv < 0 {
+		return 0, vppErr("sendto", int(rv))
+	}
+	return int(rv), nil
+}
+
+func rawRecvFrom(vlsh VLSH, p []byte) (int, AddrInfo, error) {
+	if len(p) == 0 {
+		return 0, AddrInfo{}, nil
+	}
+	var peerIP [16]C.uint8_t
+	var peerPort C.uint16_t
+	var isIP4 C.int
+	rv := C.vclpoll_recvfrom(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)),
+		&peerIP[0], &peerPort, &isIP4)
+	if rv < 0 {
+		return 0, AddrInfo{}, vppErr("recvfrom", int(rv))
+	}
+	return int(rv), addrInfoFromC(peerIP, peerPort, isIP4), nil
+}
+
+func rawEpollCreate() (VLSH, error) {
+	rv := C.vclpoll_epoll_create()
+	if rv < 0 {
+		return invalidVLSH, vppErr("epoll_create", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+func rawEpollCtl(epVLSH, rawVLSH, eventKey VLSH, events uint32, op C.int) error {
+	var ev C.struct_epoll_event
+	C.memset(unsafe.Pointer(&ev), 0, C.sizeof_struct_epoll_event)
+	ev.events = C.uint32_t(events)
+	*(*C.uint64_t)(unsafe.Pointer(&ev.data[0])) = C.uint64_t(eventKey)
+	rv := C.vclpoll_epoll_ctl(C.int(epVLSH), op, C.int(rawVLSH), &ev)
+	if rv < 0 {
+		return vppErr("epoll_ctl", int(rv))
+	}
+	return nil
+}
+
+func rawEpollAdd(epVLSH, rawVLSH, eventKey VLSH, events uint32) error {
+	return rawEpollCtl(epVLSH, rawVLSH, eventKey, events, C.EPOLL_CTL_ADD)
+}
+
+func rawEpollMod(epVLSH, rawVLSH, eventKey VLSH, events uint32) error {
+	return rawEpollCtl(epVLSH, rawVLSH, eventKey, events, C.EPOLL_CTL_MOD)
+}
+
+func rawEpollDel(epVLSH, rawVLSH VLSH) {
+	C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_DEL, C.int(rawVLSH), nil)
+}
+
+func rawEpollWait(epVLSH VLSH, buf []pollEvent, timeoutSeconds float64) int {
+	if len(buf) == 0 {
+		return 0
+	}
+	maxEvents := len(buf)
+	if maxEvents > 64 {
+		maxEvents = 64
+	}
+	var events [64]C.struct_epoll_event
+	n := C.vclpoll_epoll_wait(C.int(epVLSH), &events[0], C.int(maxEvents), C.double(timeoutSeconds))
+	if n <= 0 {
+		return 0
+	}
+	for i := 0; i < int(n); i++ {
+		buf[i] = pollEvent{
+			Vlsh:   VLSH(*(*C.uint64_t)(unsafe.Pointer(&events[i].data[0]))),
+			Events: uint32(events[i].events),
+		}
+	}
+	return int(n)
+}
+
+func addrInfoFromC(ip [16]C.uint8_t, port C.uint16_t, isIP4 C.int) AddrInfo {
+	var info AddrInfo
+	for i := range info.IP {
+		info.IP[i] = byte(ip[i])
+	}
+	p := uint16(port)
+	info.Port = uint16(p>>8) | uint16(p&0xff)<<8
+	info.IsV4 = isIP4 != 0
+	return info
+}
+
+func mode3AcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
+	return mode3AcceptFullContext(listener, nil)
+}
+
+func mode3AcceptFullContext(listener VLSH, doneCh <-chan struct{}) (VLSH, AddrInfo, error) {
+	enterVLS()
+
+	for {
+		if !appLive.Load() {
+			exitVLS()
+			return invalidVLSH, AddrInfo{}, ErrClosed
+		}
+		vlsh, info, err := rawAcceptFull(listener)
+		if err == nil {
+			exitVLS()
+			return vlsh, info, nil
+		}
+		if !isAgainError(err) {
+			exitVLS()
+			return invalidVLSH, AddrInfo{}, err
+		}
+		exitVLS()
+		if !mode3PollWaitContext(listener, epollIn, doneCh) {
+			return invalidVLSH, AddrInfo{}, ErrClosed
+		}
+		enterVLS()
+	}
+}
+
+// mode3BeginShutdown prevents parked operations from re-entering VLS after
+// the Mode 3 poller wakes them.
+func mode3BeginShutdown() {
+	appLive.Store(false)
+}
+
+// AppDestroy performs VLS application teardown when AppInit succeeded.
+// Takes vlsMu.Lock() (not RLock) because vppcom_app_destroy tears down the
+// shared VCL/VLS state and must be exclusive against every other VLS call.
+func mode3AppDestroy() {
+	if !appCreated.CompareAndSwap(true, false) {
+		return
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	registerThisThread()
+	vlsMu.Lock()
+	defer vlsMu.Unlock()
+	C.vclpoll_app_destroy()
+}
+
+func mode3GetLocalAddr(vlsh VLSH) (AddrInfo, error) {
+	defer pin()()
+	var ip [16]C.uint8_t
+	var portBE C.uint16_t
+	var isIP4 C.int
+	rv := C.vclpoll_get_local_addr(C.int(vlsh), &ip[0], &portBE, &isIP4)
+	if rv < 0 {
+		return AddrInfo{}, vppErr("get_local_addr", int(rv))
+	}
+	return addrInfoFromC(ip, portBE, isIP4), nil
+}
+
+func mode3GetPeerAddr(vlsh VLSH) (AddrInfo, error) {
+	defer pin()()
+	var ip [16]C.uint8_t
+	var portBE C.uint16_t
+	var isIP4 C.int
+	rv := C.vclpoll_get_peer_addr(C.int(vlsh), &ip[0], &portBE, &isIP4)
+	if rv < 0 {
+		return AddrInfo{}, vppErr("get_peer_addr", int(rv))
+	}
+	return addrInfoFromC(ip, portBE, isIP4), nil
+}
+
+// SetV6Only sets the IPV6_V6ONLY option on a VLS session.
+func mode3SetV6Only(vlsh VLSH, v6only bool) error {
+	defer pin()()
+	val := 0
+	if v6only {
+		val = 1
+	}
+	rv := C.vclpoll_set_v6only(C.int(vlsh), C.int(val))
+	if rv < 0 {
+		return vppErr("set_v6only", int(rv))
+	}
+	return nil
+}
+
+// --- UDP support ---
+
+// BindUDP4 creates a non-blocking UDP socket bound to ip4:port.
+func mode3BindUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
+	defer pin()()
+	rv := C.vclpoll_bind_udp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)))
+	if rv < 0 {
+		return invalidVLSH, vppErr("bind_udp4", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+// BindUDP6 creates a non-blocking UDP socket bound to an IPv6 address.
+func mode3BindUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
+	defer pin()()
+	rv := C.vclpoll_bind_udp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)))
+	if rv < 0 {
+		return invalidVLSH, vppErr("bind_udp6", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+func mode3ConnectUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_udp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)), &outVLSH)
+	return finishBlockingConnect(rv, outVLSH, "connect_udp4", 10.0)
+}
+
+func mode3ConnectUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_udp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)), &outVLSH)
+	return finishBlockingConnect(rv, outVLSH, "connect_udp6", 10.0)
+}
+
+func mode3ConnectUDP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_udp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)), &outVLSH)
+	return parseConnectResult(rv, outVLSH, "connect_udp4_start")
+}
+
+func mode3ConnectUDP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_udp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)), &outVLSH)
+	return parseConnectResult(rv, outVLSH, "connect_udp6_start")
+}
+
+// mode3SendToContext sends a UDP datagram with a cancellation signal for readiness waits.
+func mode3SendToContext(vlsh VLSH, p []byte, addr AddrInfo, doneCh <-chan struct{}) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	enterVLS()
+
+	for {
+		if !appLive.Load() {
+			exitVLS()
+			return 0, ErrClosed
+		}
+		n, err := rawSendTo(vlsh, p, addr)
+		if err == nil {
+			exitVLS()
+			return n, nil
+		}
+		if !isAgainError(err) {
+			exitVLS()
+			return 0, err
+		}
+		exitVLS()
+		if !mode3PollWaitContext(vlsh, epollOut, doneCh) {
+			return 0, ErrWaitCanceled
+		}
+		enterVLS()
+	}
+}
+
+// mode3RecvFromContext receives a UDP datagram with a cancellation signal for readiness waits.
+func mode3RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo, error) {
+	if len(p) == 0 {
+		return 0, AddrInfo{}, nil
+	}
+	enterVLS()
+
+	for {
+		if !appLive.Load() {
+			exitVLS()
+			return 0, AddrInfo{}, ErrClosed
+		}
+		n, addr, err := rawRecvFrom(vlsh, p)
+		if err == nil {
+			exitVLS()
+			return n, addr, nil
+		}
+		if !isAgainError(err) {
+			exitVLS()
+			return 0, AddrInfo{}, err
+		}
+		exitVLS()
+		if !mode3PollWaitContext(vlsh, epollIn, doneCh) {
+			return 0, AddrInfo{}, ErrWaitCanceled
+		}
+		enterVLS()
+	}
+}
+
+// --- Split connect (context-aware dial) ---
+
+func mode3ConnectTCP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_tcp4_start(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)), &outVLSH)
+	return parseConnectResult(rv, outVLSH, "connect_tcp4_start")
+}
+
+func mode3ConnectTCP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
+	defer pin()()
+	var outVLSH C.int = -1
+	rv := C.vclpoll_connect_tcp6_start((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)), &outVLSH)
+	return parseConnectResult(rv, outVLSH, "connect_tcp6_start")
+}
+
+// CloseVLSH closes a raw VLS handle (used for cancellation cleanup).
+func mode3CloseVLSH(vlsh VLSH) {
+	pollUnregister(vlsh)
+	defer pin()()
+	C.vclpoll_close(C.int(vlsh))
+}

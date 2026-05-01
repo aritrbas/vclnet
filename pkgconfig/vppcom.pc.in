@@ -1,0 +1,10 @@
+prefix=@VPP_PREFIX@
+libdir=@VPP_LIBDIR@
+includedir=@VPP_INCLUDEDIR@
+
+Name: vppcom
+Description: VPP VCL/VLS communications library (libvppcom)
+URL: https://fd.io/
+Version: @VPP_VERSION@
+Libs: -L${libdir} -lvppcom -Wl,-rpath,${libdir}
+Cflags: -I${includedir}
