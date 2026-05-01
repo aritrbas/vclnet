@@ -1,0 +1,16 @@
+# Compiled binaries
+bin/
+
+# Go build cache
+*.test
+
+# Generated pkg-config file (rendered from pkgconfig/vppcom.pc.in by `make pc`)
+pkgconfig/vppcom.pc
+
+# Editor
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
