@@ -1,0 +1,13 @@
+# Compiled binaries
+bin/
+
+# Go build cache
+*.test
+
+# Editor
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
