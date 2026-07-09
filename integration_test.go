@@ -73,7 +73,9 @@ func TestMain(m *testing.M) {
 		runServerChild()
 		return
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	vclnet.Shutdown()
+	os.Exit(code)
 }
 
 func runServerChild() {
@@ -89,6 +91,7 @@ func runServerChild() {
 		fmt.Fprintf(os.Stderr, "child: Init: %v\n", err)
 		os.Exit(2)
 	}
+	defer vclnet.Shutdown()
 
 	switch serverType {
 	case "echo":
@@ -786,7 +789,12 @@ func runUDPEchoServer(port, nMsgs int, network string) {
 			vclpoll.Close(connVLSH)
 			continue
 		}
-		vclpoll.Write(connVLSH, buf[:n])
+		written, writeErr := vclpoll.Write(connVLSH, buf[:n])
+		if writeErr != nil || written != n {
+			fmt.Fprintf(os.Stderr, "child: UDP Write: n=%d/%d err=%v\n", written, n, writeErr)
+			vclpoll.Close(connVLSH)
+			continue
+		}
 		vclpoll.Close(connVLSH)
 	}
 	vclpoll.Close(vlsh)
@@ -814,11 +822,14 @@ func TestUDPIPv4EchoSingle(t *testing.T) {
 	if _, err := conn.Write(msg); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
 
 	got := make([]byte, len(msg))
 	n, err := conn.Read(got)
 	if err != nil {
-		t.Fatalf("Read: %v", err)
+		t.Fatalf("Read: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if string(got[:n]) != string(msg) {
 		t.Errorf("echo mismatch: got %q, want %q", got[:n], msg)
@@ -854,11 +865,14 @@ func TestUDPIPv6Echo(t *testing.T) {
 	if _, err := conn.Write(msg); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+	if err := conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
 
 	got := make([]byte, len(msg))
 	n, err := conn.Read(got)
 	if err != nil {
-		t.Fatalf("Read: %v", err)
+		t.Fatalf("Read: %v\nstderr:\n%s", err, stderr.String())
 	}
 	if string(got[:n]) != string(msg) {
 		t.Errorf("echo mismatch: got %q, want %q", got[:n], msg)
@@ -869,13 +883,12 @@ func TestUDPIPv6Echo(t *testing.T) {
 
 // --- Multi-VPP-Worker Stress Tests ---
 //
-// These tests validate vclnet with VPP configured with multiple worker threads where VPP runs
-// with multiple worker threads (cpu { workers N }). They exercise:
+// These tests validate vclnet with VPP configured with multiple session workers
+// (cpu { workers N }) in both application-side VLS modes. They exercise:
 //   - High-concurrency connect storms across VPP workers
 //   - Parallel I/O from many goroutines simultaneously
-//   - Session distribution across VPP worker threads
-//   - The vls_mt_session_should_migrate path when sessions are accessed from
-//     different OS threads than the one that created them
+//   - Mode 3 shared-worker compatibility
+//   - Mode 2 session affinity without VLS migration
 //
 // Gated by VCLNET_MULTI_WORKER=1 (set by test/run_multiworker.sh).
 // Also work with single-worker VPP (just don't exercise cross-worker paths).
@@ -891,8 +904,7 @@ func skipIfNotMultiWorker(t *testing.T) {
 }
 
 // TestMultiWorkerConcurrentConnectStorm opens many connections simultaneously
-// from multiple goroutines. With multi-worker VPP, sessions are distributed
-// across VPP workers while the application remains in shared VLS mode 3.
+// from multiple goroutines under either selected VLS dispatcher.
 func TestMultiWorkerConcurrentConnectStorm(t *testing.T) {
 	skipIfNotMultiWorker(t)
 
@@ -1161,6 +1173,40 @@ func TestMultiWorkerHTTPConcurrent(t *testing.T) {
 		}
 	}
 	cmd.Process.Kill()
+}
+
+func TestMultiWorkerMode2NoMigration(t *testing.T) {
+	skipIfNotMultiWorker(t)
+	if os.Getenv("VCLNET_VLS_MODE") != "2" {
+		t.Skip("mode-2 ownership assertion only applies to VLS mode 2")
+	}
+	if err := vclnet.Init("vclnet-test-client"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if got := vclpoll.CurrentMode(); got != vclpoll.Mode2 {
+		t.Fatalf("current VLS mode=%d, want mode 2", got)
+	}
+	if got := vclpoll.Mode2OwnershipViolations(); got != 0 {
+		t.Fatalf("mode-2 ownership violations=%d; a session was routed toward migration", got)
+	}
+}
+
+func TestMultiWorkerMode2UDPUnsupported(t *testing.T) {
+	skipIfNotMultiWorker(t)
+	if os.Getenv("VCLNET_VLS_MODE") != "2" {
+		t.Skip("mode-2 UDP compatibility assertion only applies to VLS mode 2")
+	}
+	if err := vclnet.Init("vclnet-test-client"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	packetConn, err := vclnet.ListenPacket("udp4", fmt.Sprintf("127.0.0.1:%d", reserveAPIPort()))
+	if packetConn != nil {
+		_ = packetConn.Close()
+		t.Fatal("Mode 2 UDP unexpectedly created a packet connection")
+	}
+	if !errors.Is(err, syscall.EOPNOTSUPP) {
+		t.Fatalf("ListenPacket error=%v, want EOPNOTSUPP", err)
+	}
 }
 
 // --- TLS Tests ---

@@ -277,7 +277,7 @@ func (p *poller) del(epVLSH, vlsh VLSH) {
 
 // StopPoller signals the poller to exit and waits for it to stop.
 // It must run before AppDestroy so no poller VLS call remains in flight.
-func StopPoller() {
+func mode3StopPoller() {
 	defaultPoller.stop()
 }
 
@@ -301,7 +301,7 @@ func (p *poller) stop() {
 // pollWait registers vlsh for the specified events with the shared poller and
 // blocks until the event fires or the session is unregistered.
 func pollWait(vlsh VLSH, events uint32) {
-	PollWaitContext(vlsh, events, nil)
+	mode3PollWaitContext(vlsh, events, nil)
 }
 
 // pollUnregister removes every waiter for vlsh and wakes parked goroutines.
@@ -322,7 +322,7 @@ func pollUnregister(vlsh VLSH) {
 // PollWaitContext waits until an event fires or doneCh is closed. Cancellation
 // removes only this waiter; other readers or writers on the same session stay
 // registered.
-func PollWaitContext(vlsh VLSH, events uint32, doneCh <-chan struct{}) bool {
+func mode3PollWaitContext(vlsh VLSH, events uint32, doneCh <-chan struct{}) bool {
 	if !defaultPoller.start() {
 		return false
 	}

@@ -1,7 +1,7 @@
 // Low-level echo server using the internal VLS bridge.
 //
-// Each accepted connection runs in its own goroutine. Immediate VLS calls pin
-// to an OS thread; EAGAIN waits are multiplexed by the shared poller.
+// Each accepted connection runs in its own goroutine. The selected vclpoll
+// dispatcher preserves VLS thread affinity and parks EAGAIN waits.
 //
 // Run:
 //

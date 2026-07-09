@@ -1,15 +1,13 @@
 // Package vclpoll is the CGo bridge to VPP's VCL Locked Sessions (vls_*) API.
 //
 // Current implementation:
-//   - All sessions are non-blocking.
-//   - One persistent VLS epoll poller tracks multiple read/write waiters per
-//     session and exact waiter cancellation.
-//   - Public-package TCP and UDP connects use split-connect plus the shared
-//     poller so context cancellation can close in-flight sessions.
-//   - Legacy low-level DialTCP*/ConnectUDP* helpers retain a one-shot epoll
-//     timeout for compatibility.
-//   - Every immediate VLS call pins its goroutine to the current OS thread and
-//     registers that pthread once.
+//   - All sessions are non-blocking and use exact readiness waiters.
+//   - Mode 3 pins immediate calls and uses one persistent shared VLS epoll.
+//   - Mode 2 routes operations to lifetime-pinned owner workers, each with its
+//     own VLS epoll and message queue.
+//   - Public TCP and UDP connects use split-connect plus the selected
+//     readiness dispatcher so context cancellation closes in-flight sessions.
+//   - Legacy low-level dial helpers retain finite compatibility waits.
 package vclpoll
 
 /*
@@ -48,6 +46,20 @@ static void vclpoll_app_destroy(void) {
 
 static void vclpoll_register_worker(void) {
     vls_register_vcl_worker();
+}
+
+static uint32_t vclpoll_worker_index(void) {
+    return vppcom_worker_index();
+}
+
+static int vclpoll_mode2_enabled(void) {
+    return vls_mt_wrk_supported() != 0;
+}
+
+static void vclpoll_session_worker(int vlsh, uint32_t *session_index,
+                                   uint32_t *worker_index) {
+    vlsh_to_session_and_worker_index((vls_handle_t)vlsh, session_index,
+                                     worker_index);
 }
 
 // Create a non-blocking TCP listener bound to the given IPv4+port (BE).
@@ -492,10 +504,9 @@ var (
 	vlsMu sync.RWMutex
 )
 
-// AppInit performs the one-time VLS application registration (idempotent).
-// Must be called before any other vclpoll function. The OS thread that runs
-// AppInit becomes worker 0 — we pre-record it as registered.
-func AppInit(appName string) error {
+// mode3AppInit performs one-time shared-worker VLS registration. The OS thread
+// that creates the application becomes worker 0 and is recorded as registered.
+func mode3AppInit(appName string) error {
 	appOnce.Do(func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
@@ -541,6 +552,13 @@ func registerThisThread() {
 // lock. Must be paired with exitVLS(). The read lock lets many VLS calls
 // proceed concurrently while blocking only rare worker registrations and
 // app lifecycle operations.
+// markCurrentThreadRegistered records a thread whose VCL worker was created by
+// the mode-2 bootstrap path. It prevents one-shot helpers reused by a worker
+// loop from registering a second VCL worker on the same pthread.
+func markCurrentThreadRegistered() {
+	workerRegistry.Store(uintptr(C.vclpoll_pthread_self()), struct{}{})
+}
+
 func enterVLS() {
 	runtime.LockOSThread()
 	registerThisThread()
@@ -657,7 +675,7 @@ func ipBE(ip4 [4]byte) uint32 {
 func portBE(p uint16) uint16 { return uint16(p>>8) | uint16(p&0xff)<<8 }
 
 // ListenTCP4 creates a non-blocking TCP listener bound to ip4:port.
-func ListenTCP4(ip4 [4]byte, port uint16, backlog int) (VLSH, error) {
+func mode3ListenTCP4(ip4 [4]byte, port uint16, backlog int) (VLSH, error) {
 	defer pin()()
 	rv := C.vclpoll_listen_tcp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)),
 		C.int(backlog))
@@ -674,7 +692,7 @@ func ListenTCP4(ip4 [4]byte, port uint16, backlog int) (VLSH, error) {
 // (memory file findings from frida-vpp), so we do not double-check
 // connection success via SO_ERROR — EPOLLOUT is taken to mean connected,
 // matching what LDP itself does in practice.
-func DialTCP4(ip4 [4]byte, port uint16) (VLSH, error) {
+func mode3DialTCP4(ip4 [4]byte, port uint16) (VLSH, error) {
 	defer pin()()
 
 	var outVLSH C.int = -1
@@ -710,7 +728,7 @@ func DialTCP4(ip4 [4]byte, port uint16) (VLSH, error) {
 
 // Accept blocks until a new connection arrives. Returns the new conn's VLSH
 // and the peer's IPv4 + port (host order).
-func Accept(listener VLSH) (VLSH, [4]byte, uint16, error) {
+func mode3Accept(listener VLSH) (VLSH, [4]byte, uint16, error) {
 	enterVLS()
 
 	for {
@@ -739,13 +757,13 @@ func Accept(listener VLSH) (VLSH, [4]byte, uint16, error) {
 	}
 }
 
-// Read reads up to len(p) bytes. On EAGAIN it parks via the shared poller.
-func Read(vlsh VLSH, p []byte) (int, error) {
-	return ReadContext(vlsh, p, nil)
+// mode3Read reads up to len(p) bytes and uses the Mode 3 poller on EAGAIN.
+func mode3Read(vlsh VLSH, p []byte) (int, error) {
+	return mode3ReadContext(vlsh, p, nil)
 }
 
 // ReadContext is Read with a cancellation signal for the readiness wait.
-func ReadContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
+func mode3ReadContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -766,20 +784,20 @@ func ReadContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
 			return 0, vppErr("read", int(rv))
 		}
 		exitVLS()
-		if !PollWaitContext(vlsh, epollIn, doneCh) {
+		if !mode3PollWaitContext(vlsh, epollIn, doneCh) {
 			return 0, ErrWaitCanceled
 		}
 		enterVLS()
 	}
 }
 
-// Write writes up to len(p) bytes. On EAGAIN it parks via the shared poller.
-func Write(vlsh VLSH, p []byte) (int, error) {
-	return WriteContext(vlsh, p, nil)
+// mode3Write writes up to len(p) bytes and uses the Mode 3 poller on EAGAIN.
+func mode3Write(vlsh VLSH, p []byte) (int, error) {
+	return mode3WriteContext(vlsh, p, nil)
 }
 
 // WriteContext is Write with a cancellation signal for the readiness wait.
-func WriteContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
+func mode3WriteContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -800,7 +818,7 @@ func WriteContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
 			return 0, vppErr("write", int(rv))
 		}
 		exitVLS()
-		if !PollWaitContext(vlsh, epollOut, doneCh) {
+		if !mode3PollWaitContext(vlsh, epollOut, doneCh) {
 			return 0, ErrWaitCanceled
 		}
 		enterVLS()
@@ -808,7 +826,7 @@ func WriteContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
 }
 
 // Close releases the session.
-func Close(vlsh VLSH) error {
+func mode3Close(vlsh VLSH) error {
 	pollUnregister(vlsh)
 	defer pin()()
 	rv := C.vclpoll_close(C.int(vlsh))
@@ -870,7 +888,7 @@ var ErrWaitCanceled = errors.New("vclpoll: readiness wait canceled")
 // --- IPv6 support ---
 
 // ListenTCP6 creates a non-blocking TCP listener bound to an IPv6 address.
-func ListenTCP6(ip6 [16]byte, port uint16, backlog int) (VLSH, error) {
+func mode3ListenTCP6(ip6 [16]byte, port uint16, backlog int) (VLSH, error) {
 	defer pin()()
 
 	rv := C.vclpoll_listen_tcp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)),
@@ -882,7 +900,7 @@ func ListenTCP6(ip6 [16]byte, port uint16, backlog int) (VLSH, error) {
 }
 
 // DialTCP6 creates a non-blocking TCP socket and connects to an IPv6 address.
-func DialTCP6(ip6 [16]byte, port uint16) (VLSH, error) {
+func mode3DialTCP6(ip6 [16]byte, port uint16) (VLSH, error) {
 	defer pin()()
 
 	var outVLSH C.int = -1
@@ -920,8 +938,178 @@ type AddrInfo struct {
 	IsV4 bool
 }
 
+// These helpers perform exactly one VLS operation on the current OS thread.
+// They do not pin or register the thread; mode 2 calls them only from a
+// permanently pinned worker.
+func rawAppCreate(appName string) error {
+	cname := C.CString(appName)
+	defer C.free(unsafe.Pointer(cname))
+	if rv := C.vclpoll_app_create(cname); rv != 0 {
+		return fmt.Errorf("vls_app_create failed: rv=%d", int(rv))
+	}
+	return nil
+}
+
+func rawAppDestroy() { C.vclpoll_app_destroy() }
+
+func rawRegisterWorker() error {
+	C.vclpoll_register_worker()
+	if rawWorkerIndex() == ^uint32(0) {
+		return errors.New("vclpoll: VCL worker registration failed")
+	}
+	return nil
+}
+
+func rawWorkerIndex() uint32 { return uint32(C.vclpoll_worker_index()) }
+func rawMode2Enabled() bool  { return C.vclpoll_mode2_enabled() != 0 }
+
+func rawSessionWorker(vlsh VLSH) (uint32, bool) {
+	var sessionIndex C.uint32_t
+	var workerIndex C.uint32_t
+	C.vclpoll_session_worker(C.int(vlsh), &sessionIndex, &workerIndex)
+	worker := uint32(workerIndex)
+	return worker, worker != ^uint32(0) && uint32(sessionIndex) != ^uint32(0)
+}
+
+func rawAcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
+	var peerIP [16]C.uint8_t
+	var peerPort C.uint16_t
+	var isIP4 C.int
+	rv := C.vclpoll_accept_nb_full(C.int(listener), &peerIP[0], &peerPort, &isIP4)
+	if rv < 0 {
+		return invalidVLSH, AddrInfo{}, vppErr("accept", int(rv))
+	}
+	return VLSH(rv), addrInfoFromC(peerIP, peerPort, isIP4), nil
+}
+
+func rawRead(vlsh VLSH, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	rv := C.vclpoll_read(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
+	if rv < 0 {
+		return 0, vppErr("read", int(rv))
+	}
+	return int(rv), nil
+}
+
+func rawWrite(vlsh VLSH, p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	rv := C.vclpoll_write(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
+	if rv < 0 {
+		return 0, vppErr("write", int(rv))
+	}
+	return int(rv), nil
+}
+
+func rawClose(vlsh VLSH) error {
+	if rv := C.vclpoll_close(C.int(vlsh)); rv < 0 {
+		return vppErr("close", int(rv))
+	}
+	return nil
+}
+
+func rawSendTo(vlsh VLSH, p []byte, addr AddrInfo) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	ip := addr.IP
+	isIP4 := 0
+	if addr.IsV4 {
+		isIP4 = 1
+	}
+	rv := C.vclpoll_sendto(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)),
+		C.int(isIP4), (*C.uint8_t)(&ip[0]), C.uint16_t(portBE(addr.Port)))
+	if rv < 0 {
+		return 0, vppErr("sendto", int(rv))
+	}
+	return int(rv), nil
+}
+
+func rawRecvFrom(vlsh VLSH, p []byte) (int, AddrInfo, error) {
+	if len(p) == 0 {
+		return 0, AddrInfo{}, nil
+	}
+	var peerIP [16]C.uint8_t
+	var peerPort C.uint16_t
+	var isIP4 C.int
+	rv := C.vclpoll_recvfrom(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)),
+		&peerIP[0], &peerPort, &isIP4)
+	if rv < 0 {
+		return 0, AddrInfo{}, vppErr("recvfrom", int(rv))
+	}
+	return int(rv), addrInfoFromC(peerIP, peerPort, isIP4), nil
+}
+
+func rawEpollCreate() (VLSH, error) {
+	rv := C.vclpoll_epoll_create()
+	if rv < 0 {
+		return invalidVLSH, vppErr("epoll_create", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+func rawEpollCtl(epVLSH, rawVLSH, eventKey VLSH, events uint32, op C.int) error {
+	var ev C.struct_epoll_event
+	C.memset(unsafe.Pointer(&ev), 0, C.sizeof_struct_epoll_event)
+	ev.events = C.uint32_t(events)
+	*(*C.uint64_t)(unsafe.Pointer(&ev.data[0])) = C.uint64_t(eventKey)
+	rv := C.vclpoll_epoll_ctl(C.int(epVLSH), op, C.int(rawVLSH), &ev)
+	if rv < 0 {
+		return vppErr("epoll_ctl", int(rv))
+	}
+	return nil
+}
+
+func rawEpollAdd(epVLSH, rawVLSH, eventKey VLSH, events uint32) error {
+	return rawEpollCtl(epVLSH, rawVLSH, eventKey, events, C.EPOLL_CTL_ADD)
+}
+
+func rawEpollMod(epVLSH, rawVLSH, eventKey VLSH, events uint32) error {
+	return rawEpollCtl(epVLSH, rawVLSH, eventKey, events, C.EPOLL_CTL_MOD)
+}
+
+func rawEpollDel(epVLSH, rawVLSH VLSH) {
+	C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_DEL, C.int(rawVLSH), nil)
+}
+
+func rawEpollWait(epVLSH VLSH, buf []pollEvent, timeoutSeconds float64) int {
+	if len(buf) == 0 {
+		return 0
+	}
+	maxEvents := len(buf)
+	if maxEvents > 64 {
+		maxEvents = 64
+	}
+	var events [64]C.struct_epoll_event
+	n := C.vclpoll_epoll_wait(C.int(epVLSH), &events[0], C.int(maxEvents), C.double(timeoutSeconds))
+	if n <= 0 {
+		return 0
+	}
+	for i := 0; i < int(n); i++ {
+		buf[i] = pollEvent{
+			Vlsh:   VLSH(*(*C.uint64_t)(unsafe.Pointer(&events[i].data[0]))),
+			Events: uint32(events[i].events),
+		}
+	}
+	return int(n)
+}
+
+func addrInfoFromC(ip [16]C.uint8_t, port C.uint16_t, isIP4 C.int) AddrInfo {
+	var info AddrInfo
+	for i := range info.IP {
+		info.IP[i] = byte(ip[i])
+	}
+	p := uint16(port)
+	info.Port = uint16(p>>8) | uint16(p&0xff)<<8
+	info.IsV4 = isIP4 != 0
+	return info
+}
+
 // AcceptFull blocks until a new connection arrives, returning full address info.
-func AcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
+func mode3AcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
 	enterVLS()
 
 	for {
@@ -956,7 +1144,7 @@ func AcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
 
 // AcceptFullContext is like AcceptFull but respects context cancellation.
 // Returns ErrClosed if doneCh is closed before a connection arrives.
-func AcceptFullContext(listener VLSH, doneCh <-chan struct{}) (VLSH, AddrInfo, error) {
+func mode3AcceptFullContext(listener VLSH, doneCh <-chan struct{}) (VLSH, AddrInfo, error) {
 	enterVLS()
 
 	for {
@@ -984,23 +1172,23 @@ func AcceptFullContext(listener VLSH, doneCh <-chan struct{}) (VLSH, AddrInfo, e
 			return invalidVLSH, AddrInfo{}, vppErr("accept", int(rv))
 		}
 		exitVLS()
-		if !PollWaitContext(listener, epollIn, doneCh) {
+		if !mode3PollWaitContext(listener, epollIn, doneCh) {
 			return invalidVLSH, AddrInfo{}, ErrClosed
 		}
 		enterVLS()
 	}
 }
 
-// BeginShutdown prevents parked operations from re-entering VLS after the
-// shared poller wakes them.
-func BeginShutdown() {
+// mode3BeginShutdown prevents parked operations from re-entering VLS after
+// the Mode 3 poller wakes them.
+func mode3BeginShutdown() {
 	appLive.Store(false)
 }
 
 // AppDestroy performs VLS application teardown when AppInit succeeded.
 // Takes vlsMu.Lock() (not RLock) because vppcom_app_destroy tears down the
 // shared VCL/VLS state and must be exclusive against every other VLS call.
-func AppDestroy() {
+func mode3AppDestroy() {
 	if !appCreated.CompareAndSwap(true, false) {
 		return
 	}
@@ -1013,7 +1201,7 @@ func AppDestroy() {
 }
 
 // GetLocalAddr retrieves the local address of a session.
-func GetLocalAddr(vlsh VLSH) (AddrInfo, error) {
+func mode3GetLocalAddr(vlsh VLSH) (AddrInfo, error) {
 	defer pin()()
 
 	var ip [16]C.uint8_t
@@ -1034,7 +1222,7 @@ func GetLocalAddr(vlsh VLSH) (AddrInfo, error) {
 }
 
 // GetPeerAddr retrieves the remote address of a session.
-func GetPeerAddr(vlsh VLSH) (AddrInfo, error) {
+func mode3GetPeerAddr(vlsh VLSH) (AddrInfo, error) {
 	defer pin()()
 
 	var ip [16]C.uint8_t
@@ -1055,7 +1243,7 @@ func GetPeerAddr(vlsh VLSH) (AddrInfo, error) {
 }
 
 // SetV6Only sets the IPV6_V6ONLY option on a VLS session.
-func SetV6Only(vlsh VLSH, v6only bool) error {
+func mode3SetV6Only(vlsh VLSH, v6only bool) error {
 	defer pin()()
 	val := 0
 	if v6only {
@@ -1071,7 +1259,7 @@ func SetV6Only(vlsh VLSH, v6only bool) error {
 // --- UDP support ---
 
 // BindUDP4 creates a non-blocking UDP socket bound to ip4:port.
-func BindUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
+func mode3BindUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
 	defer pin()()
 	rv := C.vclpoll_bind_udp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)))
 	if rv < 0 {
@@ -1081,7 +1269,7 @@ func BindUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
 }
 
 // BindUDP6 creates a non-blocking UDP socket bound to an IPv6 address.
-func BindUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
+func mode3BindUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
 	defer pin()()
 	rv := C.vclpoll_bind_udp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)))
 	if rv < 0 {
@@ -1092,7 +1280,7 @@ func BindUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
 
 // ConnectUDP4 creates a connected UDP socket to ip4:port.
 // Waits for the connect to complete (VPP UDP connect is asynchronous).
-func ConnectUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
+func mode3ConnectUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
 	defer pin()()
 	var outVLSH C.int = -1
 	rv := C.vclpoll_connect_udp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)), &outVLSH)
@@ -1120,7 +1308,7 @@ func ConnectUDP4(ip4 [4]byte, port uint16) (VLSH, error) {
 
 // ConnectUDP6 creates a connected UDP socket to an IPv6 address.
 // Waits for the connect to complete (VPP UDP connect is asynchronous).
-func ConnectUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
+func mode3ConnectUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
 	defer pin()()
 	var outVLSH C.int = -1
 	rv := C.vclpoll_connect_udp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)), &outVLSH)
@@ -1147,7 +1335,7 @@ func ConnectUDP6(ip6 [16]byte, port uint16) (VLSH, error) {
 }
 
 // ConnectUDP4Start initiates a non-blocking UDP4 connect without waiting.
-func ConnectUDP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
+func mode3ConnectUDP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
 	defer pin()()
 	var outVLSH C.int = -1
 	rv := C.vclpoll_connect_udp4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)), &outVLSH)
@@ -1165,7 +1353,7 @@ func ConnectUDP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
 }
 
 // ConnectUDP6Start initiates a non-blocking UDP6 connect without waiting.
-func ConnectUDP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
+func mode3ConnectUDP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
 	defer pin()()
 	var outVLSH C.int = -1
 	rv := C.vclpoll_connect_udp6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)), &outVLSH)
@@ -1183,12 +1371,12 @@ func ConnectUDP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
 }
 
 // SendTo sends a UDP datagram to the specified address.
-func SendTo(vlsh VLSH, p []byte, addr AddrInfo) (int, error) {
-	return SendToContext(vlsh, p, addr, nil)
+func mode3SendTo(vlsh VLSH, p []byte, addr AddrInfo) (int, error) {
+	return mode3SendToContext(vlsh, p, addr, nil)
 }
 
 // SendToContext is SendTo with a cancellation signal for readiness waits.
-func SendToContext(vlsh VLSH, p []byte, addr AddrInfo, doneCh <-chan struct{}) (int, error) {
+func mode3SendToContext(vlsh VLSH, p []byte, addr AddrInfo, doneCh <-chan struct{}) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -1217,7 +1405,7 @@ func SendToContext(vlsh VLSH, p []byte, addr AddrInfo, doneCh <-chan struct{}) (
 			return 0, vppErr("sendto", int(rv))
 		}
 		exitVLS()
-		if !PollWaitContext(vlsh, epollOut, doneCh) {
+		if !mode3PollWaitContext(vlsh, epollOut, doneCh) {
 			return 0, ErrWaitCanceled
 		}
 		enterVLS()
@@ -1225,12 +1413,12 @@ func SendToContext(vlsh VLSH, p []byte, addr AddrInfo, doneCh <-chan struct{}) (
 }
 
 // RecvFrom receives a UDP datagram and returns the sender's address.
-func RecvFrom(vlsh VLSH, p []byte) (int, AddrInfo, error) {
-	return RecvFromContext(vlsh, p, nil)
+func mode3RecvFrom(vlsh VLSH, p []byte) (int, AddrInfo, error) {
+	return mode3RecvFromContext(vlsh, p, nil)
 }
 
 // RecvFromContext is RecvFrom with a cancellation signal for readiness waits.
-func RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo, error) {
+func mode3RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo, error) {
 	if len(p) == 0 {
 		return 0, AddrInfo{}, nil
 	}
@@ -1262,7 +1450,7 @@ func RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo
 			return 0, AddrInfo{}, vppErr("recvfrom", int(rv))
 		}
 		exitVLS()
-		if !PollWaitContext(vlsh, epollIn, doneCh) {
+		if !mode3PollWaitContext(vlsh, epollIn, doneCh) {
 			return 0, AddrInfo{}, ErrWaitCanceled
 		}
 		enterVLS()
@@ -1275,7 +1463,7 @@ func RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo
 // Returns (vlsh, true, nil) on immediate connect.
 // Returns (vlsh, false, nil) on EINPROGRESS.
 // Returns (invalidVLSH, false, err) on hard failure.
-func ConnectTCP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
+func mode3ConnectTCP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
 	defer pin()()
 	var outVLSH C.int = -1
 	rv := C.vclpoll_connect_tcp4_start(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)), &outVLSH)
@@ -1293,7 +1481,7 @@ func ConnectTCP4Start(ip4 [4]byte, port uint16) (VLSH, bool, error) {
 }
 
 // ConnectTCP6Start initiates a non-blocking TCP6 connect without waiting.
-func ConnectTCP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
+func mode3ConnectTCP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
 	defer pin()()
 	var outVLSH C.int = -1
 	rv := C.vclpoll_connect_tcp6_start((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)), &outVLSH)
@@ -1311,7 +1499,7 @@ func ConnectTCP6Start(ip6 [16]byte, port uint16) (VLSH, bool, error) {
 }
 
 // CloseVLSH closes a raw VLS handle (used for cancellation cleanup).
-func CloseVLSH(vlsh VLSH) {
+func mode3CloseVLSH(vlsh VLSH) {
 	pollUnregister(vlsh)
 	defer pin()()
 	C.vclpoll_close(C.int(vlsh))

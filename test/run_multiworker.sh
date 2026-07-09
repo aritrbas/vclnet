@@ -1,19 +1,29 @@
 #!/bin/bash
-# run_multiworker.sh — Start VPP with multiple worker threads, run stress tests.
+# run_multiworker.sh -- Start VPP with multiple worker threads, run stress tests.
 #
-# Usage: sudo -E bash run_multiworker.sh [workers] [test-filter]
-# Example: sudo -E bash run_multiworker.sh 4 TestMultiWorker
+# Usage: sudo -E bash run_multiworker.sh [--mode 2|3] [workers] [test-filter]
+# Example: sudo -E bash run_multiworker.sh --mode 2 4 TestMultiWorker
 #
 # This validates vclnet under production-like conditions where VPP distributes
 # sessions across multiple worker threads. Tests exercise:
 #   - High-concurrency connect/accept across VPP workers
 #   - Parallel I/O from many goroutines simultaneously
-#   - Shared-mode VLS access while VPP distributes session work
+#   - Session-affine VLS mode 2 or shared-worker VLS mode 3
 #   - Cut-through sessions under worker distribution
 #
-# VPP paths and the invoking user are resolved by test/env.sh — see that file
+# VPP paths and the invoking user are resolved by test/env.sh -- see that file
 # for override variables (VPP_PREFIX, RUN_AS_USER, etc.).
 set -e
+
+VLS_MODE=3
+if [ "${1:-}" = "--mode" ]; then
+    VLS_MODE="${2:-}"
+    shift 2
+fi
+if [ "$VLS_MODE" != "2" ] && [ "$VLS_MODE" != "3" ]; then
+    echo "ERROR: --mode must be 2 or 3"
+    exit 2
+fi
 
 NUM_WORKERS="${1:-4}"
 TEST_FILTER="${2:-TestMultiWorker}"
@@ -46,8 +56,13 @@ rm -rf /tmp/vclnet-test
 mkdir -p /tmp/vclnet-test/app_ns_sockets
 
 mkdir -p /tmp/vclnet-share
-cat > "$VCL_CONF" <<'EOF'
+MODE_TOKEN=""
+if [ "$VLS_MODE" = "2" ]; then
+    MODE_TOKEN="  multi-thread-workers"
+fi
+cat > "$VCL_CONF" <<EOF
 vcl {
+$MODE_TOKEN
   rx-fifo-size 4000000
   tx-fifo-size 4000000
   app-scope-local
@@ -57,7 +72,7 @@ vcl {
 }
 EOF
 
-echo "Starting VPP with $NUM_WORKERS worker threads..."
+echo "Starting VPP with $NUM_WORKERS worker threads (VLS mode $VLS_MODE)..."
 
 "$VPP_BIN" \
   unix { nodaemon log /tmp/vpp.log full-coredump cli-listen "$CLI_SOCK" runtime-dir /tmp/vclnet-test } \
@@ -104,16 +119,24 @@ fi
 
 cd "$VCLNET_DIR"
 
-echo "=== Running multi-worker integration tests (filter: $TEST_FILTER, workers: $NUM_WORKERS) ==="
+echo "=== Running multi-worker integration tests (filter: $TEST_FILTER, workers: $NUM_WORKERS, VLS mode: $VLS_MODE) ==="
 set +e
 VCL_CONFIG="$VCL_CONF" \
 VCLNET_MULTI_WORKER=1 \
 VCLNET_VPP_WORKERS="$NUM_WORKERS" \
+VCLNET_VLS_MODE="$VLS_MODE" \
+VCLNET_WORKERS="$NUM_WORKERS" \
     run_as_user \
       env VCLNET_MULTI_WORKER=1 VCLNET_VPP_WORKERS="$NUM_WORKERS" \
+          VCLNET_VLS_MODE="$VLS_MODE" VCLNET_WORKERS="$NUM_WORKERS" \
       "$GO_BIN" test -v -count=1 -timeout 300s -run "$TEST_FILTER" . 2>&1
 TEST_RC=$?
 set -e
+
+if [ $TEST_RC -eq 0 ] && ! "$VPPCTL" -s "$CLI_SOCK" show version >/dev/null 2>&1; then
+    echo "ERROR: VPP exited or stopped responding during the test run."
+    TEST_RC=1
+fi
 
 echo ""
 if [ $TEST_RC -ne 0 ]; then
@@ -124,5 +147,5 @@ if [ $TEST_RC -ne 0 ]; then
     exit $TEST_RC
 fi
 
-echo "=== All multi-worker tests passed (workers: $NUM_WORKERS) ==="
+echo "=== All multi-worker tests passed (workers: $NUM_WORKERS, VLS mode: $VLS_MODE) ==="
 exit 0

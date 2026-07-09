@@ -17,9 +17,9 @@ var (
 	signalInstalled atomic.Bool
 )
 
-// Shutdown performs graceful teardown of the VCL application layer.
-// It stops the shared poller goroutine first (so no VCL calls are in-flight),
-// then calls vppcom_app_destroy() to deregister from VPP.
+// Shutdown performs process-final teardown of the VCL application layer. It
+// stops the selected readiness dispatcher and its VLS calls before destroying
+// the application and deregistering from VPP.
 // Safe to call multiple times; subsequent calls are no-ops.
 //
 // After Shutdown is called, all vclnet operations will fail.

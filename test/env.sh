@@ -116,13 +116,14 @@ HINT
 }
 
 # run_as_user CMD [ARG ...]
-# Run CMD as $RUN_AS_USER with LD_LIBRARY_PATH / VCL_CONFIG / VCLNET_* pre-set.
+# Run CMD as $RUN_AS_USER with build and runtime environment preserved.
 # Extra env can be passed by callers via `env VAR=VALUE ...` in front of CMD.
 run_as_user() {
     if [ "$(id -u)" -eq 0 ] && [ "$RUN_AS_USER" != "root" ]; then
         sudo -u "$RUN_AS_USER" env \
             LD_LIBRARY_PATH="$VPP_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
             VCL_CONFIG="${VCL_CONFIG:-${VCL_CONF:-}}" \
+            PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}" \
             PATH="$PATH" \
             HOME="$RUN_AS_HOME" \
             "$@"
@@ -130,6 +131,7 @@ run_as_user() {
         env \
             LD_LIBRARY_PATH="$VPP_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
             VCL_CONFIG="${VCL_CONFIG:-${VCL_CONF:-}}" \
+            PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}" \
             "$@"
     fi
 }

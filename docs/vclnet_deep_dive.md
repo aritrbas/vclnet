@@ -28,11 +28,11 @@ This document is a single-source technical report covering:
 8.  [VLS — VCL Locked Sessions and Multi-Thread Modes](#8-vls--vcl-locked-sessions-and-multi-thread-modes)
 9.  [Why Goroutines Are Hostile to VCL by Default](#9-why-goroutines-are-hostile-to-vcl-by-default)
 10. [VCLNET Architecture](#10-vclnet-architecture)
-11. [The `pin()` Pattern and the Worker Registry](#11-the-pin-pattern-and-the-worker-registry)
-12. [Non-Blocking I/O and the Shared Poller](#12-non-blocking-io-and-the-shared-poller)
+11. [Threading Implementations](#11-threading-implementations)
+12. [Non-Blocking I/O and Readiness Dispatch](#12-non-blocking-io-and-readiness-dispatch)
 13. [Earlier Attempts: Why Frida-Based Approaches Failed](#13-earlier-attempts-why-frida-based-approaches-failed)
 14. [Deep-Dive Q&A: Goroutines, FDs, and Cut-Through](#14-deep-dive-qa-goroutines-fds-and-cut-through)
-15. [Known Bugs, Workarounds, and the VPP Debug-Build Race](#15-known-bugs-workarounds-and-the-vpp-debug-build-race)
+15. [Known Bugs, Workarounds, and VPP Cleanup Races](#15-known-bugs-workarounds-and-vpp-cleanup-races)
 16. [Current Status and Pending Work](#16-current-status-and-pending-work)
 17. [Appendix A: vcl.conf Tokens and Their Effects](#appendix-a-vclconf-tokens-and-their-effects)
 18. [Appendix B: Key Source Locations (Cross-Reference)](#appendix-b-key-source-locations-cross-reference)
@@ -519,13 +519,17 @@ vcl_session_t *s  = vcl_session_get (wrk, session_index);
 
 ### 7.3 Sessions in VCL
 
-A `vcl_session_t` is the *app-side* mirror of a `session_t`. It tracks the rx/tx FIFO pointers (which point into shared memory the app has mapped), the session state machine, and metadata. The encoding of `vlsh` includes the worker index in the top bits:
+A `vcl_session_t` is the app-side mirror of a `session_t`. It tracks FIFO
+pointers, state, and metadata. The VCL session handle (`vcl_session_handle_t`)
+encodes a worker and session index, but the public VLS handle (`vls_handle_t`)
+does not. `vls_alloc` returns the index of an entry in the current
+`vls_worker_t.vls_pool`. In Mode 2, two workers can therefore return the same
+raw integer for unrelated sessions.
 
-```c
-return (vcl_get_worker_index () << 24 | session_index);
-```
-
-So a vlsh embeds *which* worker owns the underlying session. This is how cross-worker calls can detect they need to migrate.
+VLS stores the owning `vcl_wrk_index` inside each locked-session entry and
+exposes it through `vlsh_to_session_and_worker_index`. vclnet Mode 2 uses a
+process-unique virtual handle mapped to `{owner worker, raw VLS handle}` and
+checks that recorded VCL worker before every operation.
 
 ### 7.4 What `vppcom_worker_register` does
 
@@ -577,7 +581,7 @@ vls_mt_session_should_migrate (vcl_locked_session_t *vls) {
 
 This mode is **the only one with real parallelism** — each worker has its own MQ and can independently drive sessions.
 
-### 8.3 Mode 3: Single-worker multi-thread (vclnet's current mode)
+### 8.3 Mode 3: Single-worker multi-thread (vclnet default)
 
 This is the default when `multi-thread-workers` is *not* set in `vcl.conf`:
 
@@ -639,41 +643,40 @@ Putting it all together, here are the **specific** ways naive goroutine + VCL co
 
 ## 10. VCLNET Architecture
 
-### 10.1 Three layers
+### 10.1 Layers and dispatch
 
 ```text
 +------------------------------------------------------------------+
-|  Go app: net.Listener / net.Conn / net/http                      |
-+------------------------------------------------------------------+
-|  vclnet/                                                          |
-|    vclnet.go     Init(), Listen(), Dial(), DialTimeout()         |
-|    listener.go   tcpListener (net.Listener)                       |
-|    conn.go       tcpConn (net.Conn) — Read/Write/Close/...        |
-|    addr.go       Parse + DNS via net.DefaultResolver              |
-|    errors.go     *net.OpError wrapping                            |
-+------------------------------------------------------------------+
-|  vclnet/internal/vclpoll/cgo.go                                   |
-|    Go-side:                                                       |
-|      pin()  = LockOSThread + register worker once                 |
-|      workerRegistry sync.Map[pthread_self() -> {}]                |
-|      AppInit, ListenTCP4/6, ConnectTCP4/6Start, AcceptFull,               |
-|      Read, Write, Close, GetLocalAddr, GetPeerAddr, SetV6Only     |
-|    C-side (in cgo comment block):                                 |
-|      vclpoll_app_create, vclpoll_register_worker                  |
-|      vclpoll_listen_*_nb, vclpoll_connect_*_nb                    |
-|      vclpoll_accept_nb_full                                       |
-|      vclpoll_read, vclpoll_write, vclpoll_close                   |
-|      vclpoll_epoll_* (persistent shared poller)                |
-|      vclpoll_get_local/peer_addr, vclpoll_set_v6only              |
-+------------------------------------------------------------------+
-|  libvppcom.so (VPP shared library)                                |
-|    vls_app_create, vls_register_vcl_worker, vls_create,           |
-|    vls_bind, vls_listen, vls_accept, vls_connect,                 |
-|    vls_read, vls_write, vls_close, vls_epoll_*, vls_attr, ...     |
-+------------------------------------------------------------------+
-|  vpp_main process (session layer, transports, NIC)                |
+| Go app: net.Listener, net.Conn, net/http                         |
++-------------------------------+----------------------------------+
+                                |
++-------------------------------v----------------------------------+
+| vclnet public package                                             |
+| Init or InitWithOptions, Listen, Dial, deadlines, Shutdown       |
++-------------------------------+----------------------------------+
+                                |
++-------------------------------v----------------------------------+
+| internal/vclpoll dispatcher                                      |
+|                                                                  |
+| Mode 3 default                    Mode 2 opt-in                    |
+| per-call thread pinning           N lifetime-pinned workers       |
+| one shared epoll poller            owner map and per-worker epoll  |
++-------------------------------+----------------------------------+
+                                |
++-------------------------------v----------------------------------+
+| libvppcom.so: vls_create, bind, accept, connect, I/O, epoll      |
++-------------------------------+----------------------------------+
+                                |
++-------------------------------v----------------------------------+
+| VPP session layer, shared-memory FIFOs, MQs, transports          |
 +------------------------------------------------------------------+
 ```
+
+`internal/vclpoll/dispatch.go` preserves the package-level API used by the
+public package. It selects one dispatcher during initialization, so callers do
+not branch on a threading mode. `mode2.go` owns virtual-handle routing and
+`worker.go` owns the pinned loops; `poller.go` remains the Mode 3 readiness
+implementation.
 
 ### 10.2 Build & link
 
@@ -699,8 +702,8 @@ context-aware dialing and accept, an HTTP transport/client, and error
 classification helpers. See the API list in [../README.md](../README.md).
 
 The TCP connection implements `Read`, `Write`, `Close`, address access,
-and resettable deadlines. Deadline changes wake an operation already parked in
-the shared poller. The UDP connection implements connected `net.Conn`
+and resettable deadlines. Deadline changes wake an operation already parked in the selected readiness
+dispatcher. The UDP connection implements connected `net.Conn`
 behavior; its arbitrary-peer `PacketConn` behavior remains incomplete because
 VPP accepts incoming UDP peers as separate sessions.
 
@@ -714,145 +717,98 @@ In `conn.go`, `tcpConn.vlsh` is of type `vclpoll.VLSH` (an opaque handle type us
 
 ---
 
-## 11. The `pin()` Pattern and the Worker Registry
+## 11. Threading implementations
 
-This is the **central correctness mechanism** of vclnet.
+### 11.1 Mode 3: per-call pinning and the worker registry
+
+Mode 3 retains the compatibility mechanism:
 
 ```go
-// internal/vclpoll/cgo.go
-
-var workerRegistry sync.Map // pthread id (uintptr) -> struct{}
-
 func pin() func() {
     runtime.LockOSThread()
-    tid := uintptr(C.vclpoll_pthread_self())
-    if _, ok := workerRegistry.Load(tid); !ok {
-        C.vclpoll_register_worker()
-        workerRegistry.Store(tid, struct{}{})
-    }
-    return runtime.UnlockOSThread
-}
-```
-
-And every public entry point begins with:
-
-```go
-defer pin()()
-```
-
-### 11.1 What this guarantees
-
-| Property | Guaranteed because |
-| --- | --- |
-| The goroutine cannot migrate between Ms during a VLS call | `runtime.LockOSThread()` is held throughout |
-| `__vcl_worker_index` is correct for this thread | The first VLS call on a fresh M calls `vls_register_vcl_worker` and `vcl_set_worker_index` |
-| VLS lock-tracking TLS (`vls_mt_pthread_local`) is coherent | We never leave the M mid-call |
-| `vls_register_vcl_worker` is called **at most once per pthread** | The `sync.Map` keyed by `pthread_self()` |
-| AppInit runs on the right thread | `AppInit` itself uses `runtime.LockOSThread()` and records the initial pthread |
-
-### 11.2 `AppInit` is special
-
-```go
-func AppInit(appName string) error {
-    appOnce.Do(func() {
-        runtime.LockOSThread()
-        defer runtime.UnlockOSThread()
-        cname := C.CString(appName)
-        defer C.free(unsafe.Pointer(cname))
-        rv := C.vclpoll_app_create(cname)
-        if rv != 0 {
-            appErr = fmt.Errorf("vls_app_create failed: rv=%d", int(rv))
-            return
-        }
-        workerRegistry.Store(uintptr(C.vclpoll_pthread_self()), struct{}{})
-    })
-    return appErr
-}
-```
-
-* `sync.Once` makes it idempotent (re-calling Init is a no-op).
-* Pre-records the main pthread as already registered — `vls_app_create` itself implicitly creates worker 0 on the calling thread.
-* MUST be called **once at program start, on the main goroutine, before any other goroutine is spawned**. This avoids `clib_mem_init` colliding with Go's stack growth on other Ms.
-
-### 11.3 What `pin()` does not solve
-
-- **Mode 3 serialization:** calls are correct across registered threads, but
-  all application-side VLS work shares one worker and its locks.
-- **Mode 2 ownership:** `multi-thread-workers` assigns sessions to individual
-  VCL workers. The current single poller cannot touch every session without
-  crossing ownership boundaries.
-- **Portable deployment:** pinning does not address the hard-coded build tree
-  or VPP ABI/version validation.
-- **Full lifecycle draining:** Shutdown now gates new work and wakes poller
-  waiters, but a registry-driven graceful drain remains pending.
-
-## 12. Non-Blocking I/O and the Shared Poller
-
-### 12.1 Why non-blocking is required
-
-If a Go goroutine calls a *blocking* `vls_read` and the FIFO is empty, that goroutine pins its M inside CGo for an unbounded time. The Go runtime sees the M is blocked → spawns another M to keep other goroutines running. Under concurrent load this leads to **M-count inflation** — hundreds of Ms each parked in CGo, each tying up a pthread, each potentially registered as a VCL worker.
-
-So **every VCL session in vclnet is created non-blocking** (`vls_create(proto, /*is_nonblocking=*/1)`), and `vls_read`/`vls_write`/`vls_accept`/`vls_connect` all return `-EAGAIN` (or `-EINPROGRESS` for connect) when not immediately satisfiable.
-
-### 12.2 The shared poller goroutine
-
-A single background goroutine owns one persistent `vls_epoll` handle (`internal/vclpoll/poller.go`). When `Read`, `Write`, or `Accept` get EAGAIN:
-
-1. The calling goroutine releases its OS thread (`runtime.UnlockOSThread()`).
-2. It sends a `waiter{vlsh, events, ready}` struct to the poller's registration channel.
-3. It blocks on `<-ready` (a Go channel).
-4. The poller adds the vlsh to its persistent epoll via `vls_epoll_ctl(ADD)`.
-5. On the next `vls_epoll_wait` iteration that reports the vlsh ready, the poller closes `ready`.
-6. The calling goroutine wakes, re-locks an OS thread, registers the worker, and retries the VLS operation.
-
-```go
-// poller.go — core loop (simplified)
-func (p *poller) loop() {
-    runtime.LockOSThread() // permanent
     registerThisThread()
-
-    ep, _ := pollerEpollCreate()
-    p.epVLSH = ep
-
-    for {
-        p.drainRegistrations()   // add new waiters to epoll
-        p.drainUnregistrations() // remove closed sessions
-        n := pollerEpollWait(ep, eventBuf)
-        for i := 0; i < n; i++ {
-            close(p.waiters[eventBuf[i].Vlsh].ready) // wake goroutine
-        }
-    }
+    vlsMu.RLock()
+    return exitVLS
 }
 ```
 
-Critically, `vls_epoll_wait` also **drains the worker's MQ** as a side effect. The poller's continuous 100ms polling loop ensures session events (accepts, closes, RX events) are always delivered, even when no application goroutine happens to be retrying I/O.
+The goroutine cannot migrate during a VLS call, pthread-local lock tracking
+remains coherent, and registration is serialized against active VLS calls. The
+calling goroutine releases the M before parking for readiness. Because
+`multi-thread-workers` is absent, all registered threads share VCL worker 0.
 
-### 12.3 Connect uses the shared poller
+### 11.2 Mode 2: lifetime-pinned owner loops
 
-The public TCP dial path initiates a non-blocking connect with
-`ConnectTCP4Start` / `ConnectTCP6Start` and waits for EPOLLOUT through
-`PollWaitContext`. Connected UDP now uses the equivalent split-connect
-helpers. This lets context cancellation remove the precise connect waiter and
-close the in-flight session.
+Mode 2 cannot safely let arbitrary goroutines call VLS. Initialization creates
+N goroutines and locks each to one OS thread for its lifetime. Worker 0 calls
+`vls_app_create`; later workers call `vls_register_vcl_worker` sequentially.
+After all registrations finish, each worker creates its own epoll handle and
+runs a bounded operation-drain plus epoll loop.
 
-The low-level `DialTCP4`, `DialTCP6`, `ConnectUDP4`, and
-`ConnectUDP6` compatibility helpers still contain a one-shot temporary epoll
-wait, but the public vclnet dialer does not use those paths.
+Creation operations are round-robin. Accepted sessions inherit the listener
+owner. Every read, write, attribute query, wait registration, cancellation, and
+close is submitted to that same worker. The dispatcher checks raw ownership
+before each operation, so cross-worker migration is rejected rather than
+triggered.
 
-VPP's reliable post-connect error query is still an open item in this target
-build; today readiness is treated as completion after immediate hard failures
-have been handled.
+Raw VLS handles are indexes in a per-worker pool, so Mode 2 must not expose
+them as process-wide identities. Its internal virtual handles disambiguate raw
+collisions and provide the epoll data key while epoll control receives the raw
+owner-local handle.
 
-### 12.4 Benefits of the Shared Poller
+### 11.3 Initialization and teardown constraints
 
-| Metric | Temp-epoll-per-call (original) | Shared poller (current) |
-| --- | --- | --- |
-| Epoll handles created/destroyed per second | Thousands (one per EAGAIN) | 1 total (persistent) |
-| MQ drain frequency | Only when a goroutine retries | Continuous (100ms loop) |
-| OS threads held during I/O wait | One per waiting goroutine | Zero (released before parking) |
-| M-count inflation under load | High (each EAGAIN holds an M for up to 1s) | Minimal (Ms released immediately) |
+Mode 2 requires `multi-thread-workers` in `vcl.conf`; initialization verifies
+`vls_mt_wrk_supported`. The pinned VPP 26.06 build has no exported
+`vls_use_workers_only` symbol, so the config token is the supported switch.
 
----
+Shutdown wakes waiters, closes sessions on their owners, drains bounded VPP
+cleanup work, and waits for non-bootstrap threads to disappear before app
+destruction. Worker 0 is parked afterward because its pthread VLS destructor
+is unsafe once global VLS state has been destroyed. Reinitialization is not
+supported.
+
+## 12. Non-Blocking I/O and Readiness Dispatch
+
+Every session is non-blocking. VLS read, write, accept, and connect operations
+return EAGAIN or EINPROGRESS instead of pinning an M inside CGo indefinitely. A
+caller that cannot proceed waits on a Go channel and retries after readiness.
+
+### 12.1 Mode 3 readiness
+
+One permanently pinned goroutine owns a persistent VLS epoll handle and drives
+the shared worker MQ. It stores an exact set of waiters per session and
+registers their union event mask. An event wakes only matching operations;
+error and hangup wake all waiters. Deadline cancellation removes one waiter,
+not the whole session.
+
+### 12.2 Mode 2 readiness
+
+Each owner worker owns one VLS epoll handle and its own waiter map. Adding or
+cancelling a waiter is an operation on that worker. The loop processes a
+bounded operation batch, calls `vls_epoll_wait` with a short timeout, and wakes
+matching callers. A saturated batch uses a zero timeout so queued operations
+continue without starving MQ or readiness processing.
+
+```text
+caller -> owner opCh -> immediate vls_*
+                         |
+                         `-- EAGAIN -> owner epoll wait set
+                                           |
+caller Go channel <---------------- event --+
+```
+
+The public split-connect paths use the selected dispatcher for EPOLLOUT and
+context cancellation. Low-level compatibility dial helpers retain a finite
+legacy wait. Reliable post-EPOLLOUT connect-error verification remains pending
+because the target VPP error attribute is not reliable.
+
+### 12.3 Why both avoid M inflation
+
+Neither design holds one OS thread per blocked connection. Mode 3 uses one
+readiness thread for all sessions. Mode 2 uses the fixed worker count chosen at
+initialization. Application goroutines remain ordinary schedulable goroutines
+while parked on channels.
 
 ## 13. Earlier Attempts: Why Frida-Based Approaches Failed
 
@@ -873,7 +829,7 @@ For historical context, two earlier sister projects tried other strategies. Both
 | No fake-FD leakage | no | no | yes |
 | Independent of Go runtime poller | no (conflicts) | no (conflicts) | yes (separate VLS epoll) |
 | Handles MPTCP probe | manual hack | broken | N/A by construction |
-| No single-threaded bottleneck | no | no | yes |
+| No single-threaded bottleneck | no | no | Mode 2 opt-in |
 | Non-network syscall overhead | ~0 | ~3–5 µs / call | 0 |
 | Source-code changes required in target app | none | none | **import-path change only** |
 | Binary modification at runtime | Frida attach | Frida attach | none |
@@ -989,20 +945,20 @@ Beyond the specific issues above, Frida itself is the wrong tool for this job. T
 | # | Why vclnet | Detail |
 | --- | --- | --- |
 | 1 | **Right abstraction boundary** | The intersection point between Go and VCL is `net.Conn`/`net.Listener`, not individual syscalls. vclnet draws the line exactly there. |
-| 2 | **Honours VCL's per-pthread contract** | `runtime.LockOSThread` makes a goroutine *be* a pthread for the duration of a VLS call; `sync.Map` worker registry calls `vls_register_vcl_worker` exactly once per M. |
+| 2 | **Honours the VCL pthread contract** | Mode 3 pins each immediate call; Mode 2 executes every operation on a lifetime-pinned owner worker. |
 | 3 | **No fake FDs** | `vlsh` is an internal type (`vclpoll.VLSH` aliased to `int32`) that never escapes `internal/vclpoll`. The Go runtime poller never sees it; EBADF risk is structurally zero. |
-| 4 | **Standard Go errors** | `*net.OpError` wrapping; deadlines via `atomic.Value`; `net.Error.Timeout()` semantics. `crypto/tls`, `net/http`, gRPC all "just work" on top. |
+| 4 | **Standard Go errors** | `*net.OpError`, mutex-backed resettable deadlines, and `net.Error.Timeout()` semantics; layered TLS and HTTP/1.1 are tested. |
 | 5 | **Zero hook maintenance** | No syscalls intercepted. Go version upgrades don't break the bridge. New Go syscall wrappers don't matter. |
 | 6 | **Native CGo ABI** | The Go ↔ C ABI is the supported, maintained path. CGo handles register conventions, stack switching, GC interaction. |
 | 7 | **Build-time linkage** | Linked against `libvppcom.so` at build time with rpath baked in. No runtime injection, no `LD_PRELOAD`, no agent. Deployable as a single binary + shared lib. |
-| 8 | **Supports goroutine concurrency** | Mode 3 is correct under concurrent goroutines but serializes inside VLS. Mode 2 parallelism requires the pending session-affinity redesign. |
+| 8 | **Supports goroutine concurrency** | Mode 3 is compatible but serialized; Mode 2 routes concurrent sessions across fixed owner workers. |
 | 9 | **Controlled initialization** | Calling `AppInit` once, early, avoids the unsafe in-hook initialization pattern seen in the prototype; it is a deployment requirement, not proof against every allocator interaction. |
 | 10 | **Cut-through-ready** | The vcl.conf already enables `app-scope-local`; vclnet's `vls_connect` / `vls_accept` exercise the CT transport path automatically when both peers are local. |
-| 11 | **Composable with existing libs** | Because the output is `net.Conn`, any library that takes a `net.Conn` (TLS, HTTP/2, gRPC over HTTP/2, Kafka client, Redis client, …) works unmodified. |
+| 11 | **Composable with existing libs** | Libraries that accept `net.Conn` can use vclnet; layered TLS and HTTP/1.1 are tested, while HTTP/2 and gRPC still need explicit validation. |
 | 12 | **Debuggable** | Stack traces are pure Go + cgo + C. `delve` walks the Go side; `gdb` walks the C side. No JS layer. |
 | 13 | **MPTCP / new probes don't matter** | vclnet's `vls_create` is called with `VPPCOM_PROTO_TCP` directly. The kernel is never asked anything about MPTCP, so probes never fire. |
-| 14 | **No application busy-wait** | EAGAIN parks the goroutine on a Go channel while the shared VLS epoll poller owns readiness and MQ draining. |
-| 15 | **True netpoller architecture** | A single shared poller goroutine parks waiters on Go channels — structurally analogous to Go's own `runtime.netpoll`. |
+| 14 | **No application busy-wait** | EAGAIN parks callers on Go channels while the selected Mode 3 or Mode 2 readiness loop drives MQ events. |
+| 15 | **VLS readiness architecture** | One shared poller in Mode 3 or one epoll loop per owner in Mode 2; the Go runtime never sees a VLS handle. |
 | 16 | **Honest contract with VPP** | vclnet uses VLS exactly as VLS was designed to be used: one pthread = one worker, lifetime-coherent, called serially per session. No deception. |
 
 **One-line summary:** Frida tries to *make Go pretend syscalls went to VCL*. vclnet *implements `net.Conn` on top of VCL*. The second is what was supposed to exist from day one.
@@ -1031,33 +987,29 @@ On top of that, `go-frida-vpp` had to call `vls_app_create` from inside the proc
 
 **Honest answer:** for one connection, mostly fine. For >1 concurrent goroutine doing I/O, you get non-deterministic latency spikes, EBADF storms from fake FDs leaking into non-hooked syscalls, and eventually stack/memory corruption. The approach is structurally O(N) at best and not safe under goroutine scheduling at all.
 
-### Q2. Can you have 2 different goroutines working on a common file descriptor (vlsh)?
+### Q2. Can two goroutines use the same vclnet connection?
 
-**Yes, with caveats — and the answer depends on which VLS mode you're in.**
+Yes. The public object follows normal `net.Conn` concurrency semantics: multiple
+goroutines may call methods concurrently, while two readers still race for the
+same byte stream as they would with the standard library.
 
-In vclnet's vclpoll layer, every entry point begins with `defer pin()()`. So:
+The implementation differs by mode:
 
-* Goroutine A and goroutine B both call `tcpConn.Read(b)` on the same `vlsh`.
-* Each one pins to whatever M it currently runs on. If A's M and B's M are different, both Ms get registered with VLS (each once, via the `sync.Map`).
-* Inside VPP/VLS the per-vls spinlock serialises the actual operation:
+* In Mode 3, each immediate call pins its current OS thread and VLS locks
+  serialize shared worker state.
+* In Mode 2, both callers submit operations to the same owning worker. The
+  worker operation channel serializes raw session access without migration.
+  Different sessions can execute in parallel when they have different owners.
 
-```c
-static inline void vls_lock (vcl_locked_session_t *vls) {
-    if (vlsl->vls_mt_needs_locks || vls_is_shared (vls))
-        clib_spinlock_lock (&vls->lock);
-}
-```
+Read and write deadline state is shared and protected by `deadlineState`
+mutexes. Exact waiter cancellation means changing a read deadline does not
+remove a concurrent writer. `closeOnce`, atomic closed state, owner-side waiter
+removal, and owner-map invalidation make close races return errors instead of
+crossing workers.
 
-**Correctness is preserved** — two goroutines on the same vlsh will not corrupt VLS state.
-
-**Caveats:**
-
-1.  **Semantics are POSIX-like** — two readers on the same socket race for bytes; you get whatever interleaving the scheduler hands you. Same as stdlib `net.Conn`.
-2.  **Deadline state is shared** — both goroutines see the same `readDeadline` / `writeDeadline` on the `tcpConn` (stored in `atomic.Value`).
-3.  **Close races as usual** — vclnet uses `closeOnce` + `closed atomic.Bool` so close is idempotent, but a Read in flight on goroutine A while B closes can still observe `-EBADFD` on the way back. That error is wrapped and returned cleanly.
-4.  **In mode 3 (vclnet's current mode), all VCL traffic globally serialises on `vls_mt_mq_mlock`** anyway. Two goroutines on *different* vlshes aren't really parallel either; they both queue on the MQ mutex.
-
-So yes, sharing a vlsh between goroutines is safe; the design just doesn't gain anything from doing so because there's no parallel work to be done on a single TCP/CT session.
+A raw `vlsh` is never a public file descriptor. In Mode 2 it is not even a
+process-wide identity: vclnet uses a virtual handle because worker-local VLS
+pool indexes collide.
 
 ### Q3. Golang VCL needs cut-through. VCL has per-thread state. What do we do with goroutines?
 
@@ -1089,99 +1041,71 @@ Cut-through doesn't change much: the *transport* is in shared memory, but the *c
 
 #### What vclnet does about it
 
-```go
-func pin() func() {
-    runtime.LockOSThread()
-    tid := uintptr(C.vclpoll_pthread_self())
-    if _, ok := workerRegistry.Load(tid); !ok {
-        C.vclpoll_register_worker()
-        workerRegistry.Store(tid, struct{}{})
-    }
-    return runtime.UnlockOSThread
-}
-```
+vclnet provides two answers behind the same dispatcher API.
 
-The contract:
+**Mode 3** pins a goroutine for each immediate VLS call, registers the current
+pthread once, and releases the M before a readiness wait. One permanently
+pinned poller owns the shared VLS epoll handle. This is the compatibility
+default and VLS serializes shared worker state.
 
-1.  `runtime.LockOSThread()` on entry, `UnlockOSThread()` on exit. While locked, the Go scheduler guarantees the goroutine stays on this M *and the M won't be killed under it*.
-2.  `workerRegistry sync.Map[pthread_self()]struct{}` ensures the first time any pthread touches VCL we call `vls_register_vcl_worker()` exactly once.
-3.  Per-call locking (not per-goroutine-lifetime) keeps the model simple: pin for the duration of one VLS call, release the M, the scheduler can pick a different goroutine next.
-4.  Worker-0 is eagerly recorded in `AppInit`, which runs once on the main goroutine before others are spawned.
-
-This solves **correctness** in two scenarios:
-
-* N goroutines, each calling VCL on whichever M is free. Each call pins, may register that M as a new VCL worker (once), does its work, releases the M.
-* A goroutine doing several VCL calls in succession. Each `pin()` pins it for one call; between calls it can float.
-
-#### How the shared poller addresses this
-
-The implemented poller owns one VLS epoll handle on a goroutine pinned for its
-lifetime. Ordinary connection goroutines pin only around immediate VLS calls.
-On EAGAIN they release the OS thread and wait on Go channels.
-
-The poller maintains one epoll registration per session, with a union mask and
-independent waiter objects. This matters for a `net.Conn`, where one reader
-and one writer are allowed concurrently. Deadline cancellation removes only
-the affected waiter.
-
-In current mode 3, all registered threads share worker 0. The poller can
-therefore touch a session created by another thread without crossing a VCL
-worker ownership boundary, although VLS locks serialize application-side work.
-
-#### Future mode-2 picture
-
-A mode-2 design cannot simply enable `multi-thread-workers` in the existing
-configuration. It needs a fixed set of permanently pinned worker event loops:
+**Mode 2** creates a fixed set of lifetime-pinned worker loops. Worker 0 creates
+the application; the others register sequentially. Creation is round-robin,
+and a process-unique handle records the owning worker plus raw local handle.
+Every read, write, attribute, epoll-control, cancellation, and close operation
+runs on that owner. Each owner also drives its own MQ through its own epoll.
+Only TCP sessions enter this pool on the pinned VPP build; Mode 2 UDP returns
+an error wrapping `EOPNOTSUPP` before VLS allocation.
 
 ```text
 Go callers
    |
-   +-- submit operation to owner W0 -- pinned thread, VCL worker 0, epoll 0
+   +-- virtual handle -> owner W0 -> pinned VCL worker 0 and epoll 0
    |
-   `-- submit operation to owner W1 -- pinned thread, VCL worker 1, epoll 1
+   `-- virtual handle -> owner W1 -> pinned VCL worker 1 and epoll 1
 ```
 
-Every session operation, including create, read/write, epoll control, and
-close, must execute on its owning worker. This avoids migration of active
-sessions and gives each worker its own message queue. Task processing and
-epoll waiting must be integrated into each event loop without starving either.
-
-That architecture is pending and is not exercised by
-`test/run_multiworker.sh`; that script configures multiple VPP workers while
-retaining application-side VLS mode 3.
+This is the only safe way to obtain Mode 2 parallelism without VLS session
+migration. `test/run_multiworker.sh --mode 2` enables the matching VCL token,
+sets the worker count, runs the stress suite, and checks that every ownership
+preflight stayed on the expected VCL worker. Mode 3 remains the default while
+Mode 2 completes soak, listener-sharding, and performance rollout gates.
 
 ---
 
-## 15. Known Bugs, Workarounds, and the VPP Debug-Build Race
+## 15. Known Bugs, Workarounds, and VPP Cleanup Races
 
-### 15.1 The cut-through cleanup race (debug builds)
+### 15.1 Cut-through cleanup races in the pinned VPP build
 
-**Symptom:** With multiple CT sessions in the same VLS app doing overlapping I/O, debug-build VPP intermittently resets sessions with `ECONNRESET` or returns spurious EOF; rarely crashes with poison values like `0xdeadd9ee`.
-
-**Stack pattern:**
+The pinned VPP 26.06 release build exposed a deterministic Mode 2 connected-UDP
+cleanup failure while this refactor was validated. VPP could execute a queued
+cut-through TX event after the session had been released and crash here:
 
 ```text
-ct_handle_cleanups -> ct_session_postponed_cleanup
-                  -> segment_manager_dealloc_fifos_ct (assertion: cnt >= 0)
+ct_custom_tx
+  -> svm_fifo_unset_event(s->tx_fifo)
+  -> session_tx_fifo_dequeue_internal
+  -> session_queue_node_fn
 ```
 
-**Root cause:** Cleanup of one CT session runs asynchronously on a VPP worker while other CT sessions in the same segment context are still enqueueing/dequeueing. Shared segment-context state gets touched concurrently; in debug builds, additional assertions widen the window and surface the corruption.
+Earlier debug-build stress also exposed postponed CT cleanup assertions and
+resets under overlapping sessions. Both symptoms point to timing-sensitive VPP
+cleanup around scheduled FIFO or session events; they are not evidence that a
+Go VLS call may safely cross ownership.
 
-**Trigger conditions (all required):**
+Current defenses are explicit and testable:
 
-1.  Multiple CT sessions in the same VLS app.
-2.  Two or more sessions performing I/O overlapping in time.
-3.  VPP built with `-DCMAKE_BUILD_TYPE=Debug` (release builds make the timing window too narrow to hit in practice).
+* Mode 2 rejects UDP bind, connect, send, and receive entry points before VLS
+  allocation with an error wrapping `EOPNOTSUPP`.
+* Mode 2 workers drain bounded MQ cleanup work before unregister and app
+  destruction.
+* Integration server subprocesses call `Shutdown` instead of relying on abrupt
+  process exit.
+* The multi-worker harness probes VPP after the Go tests and fails the run if
+  VPP crashed or stopped responding.
 
-**Workarounds applied in the test suite:**
-
-* Sequential dials (no concurrent `connect()`).
-* Sequential I/O across sessions (one session in flight at a time).
-* 1-second sleep between tests (`skipIfNoVPP` helper) to let `ct_handle_cleanups` complete.
-* Full VPP restart between test suites (`test/run_integration.sh`).
-* Explicit removal of both CLI and app-namespace Unix sockets before VPP restart (prevents stale-socket-detection races).
-
-**Production recommendation:** Run against a **release** VPP build before declaring this a real bug. The vclnet library itself is not at fault here.
+The fail-fast gate is a compatibility defense, not a substitute for an
+upstream fix. A minimal VPP reproducer, an upstream report, and validation on a
+fixed build are required before Mode 2 UDP can be enabled.
 
 ### 15.2 Test infrastructure issues that were resolved
 
@@ -1198,29 +1122,34 @@ ct_handle_cleanups -> ct_session_postponed_cleanup
 
 ## 16. Current Status and Pending Work
 
-The audited implementation covers TCP and connected UDP on IPv4/IPv6,
-context-aware connection and accept paths, live deadlines, HTTP/1.1, layered
-TLS, shared-poller concurrency, shutdown, and multi-VPP-worker stress.
+The implementation covers TCP on IPv4 and IPv6 in both modes and connected UDP
+in Mode 3, plus context-aware connect and accept, resettable deadlines,
+HTTP/1.1, layered TLS, shutdown, and multi-VPP-worker stress. Mode 3 remains the
+default compatibility dispatcher. Mode 2 is implemented as an opt-in,
+session-affine TCP worker pool with per-worker epoll, virtual handles,
+ownership preflight, exact cancellation, ordered teardown, and fail-fast UDP
+rejection.
 
-It is not accurate to describe every networking feature as complete.
-Unconnected UDP `PacketConn` semantics are not implemented end to end, VLS
-mode 2 is incompatible with the shared poller, build paths are
-workstation-specific, and the repository lacks automated VPP version-matrix CI
-and a checked-in comparative performance baseline.
+It is not accurate to describe the library as production-complete. Unconnected
+UDP `PacketConn` semantics are incomplete. Mode 2 UDP is disabled pending a VPP
+cleanup fix, and Mode 2 still needs sustained supported-surface and teardown
+soak, sharded listeners, CI history, and a reproducible performance baseline
+before it can become the default. HTTP/2, current gRPC,
+native VCL TLS, half-close, and a VPP version matrix also remain open.
 
-The canonical prioritized list, including connect-error verification,
-lifecycle hardening, native TLS, half-close, and protocol coverage, is
-[../summary.md](../summary.md#3-pending-work). That list supersedes older
-phase/roadmap statements in this historical report.
+The canonical prioritized list is
+[../summary.md](../summary.md#3-pending-work). It supersedes older roadmap
+statements in the historical portions of this report.
 
 **Current validation entry points:**
 
-- `go test -count=1 ./...`
-- `go test -race -count=1 ./...`
-- `go vet ./...`
-- `sudo bash test/run_integration.sh`
-- `sudo bash test/run_multiworker.sh 4`
-- `make build`
+* `make test`
+* `make race`
+* `make vet`
+* `make build`
+* `sudo -E bash test/run_integration.sh`
+* `sudo -E bash test/run_multiworker.sh --mode 3 4`
+* `sudo -E bash test/run_multiworker.sh --mode 2 4`
 
 ## Appendix A: vcl.conf Tokens and Their Effects
 
@@ -1232,7 +1161,7 @@ phase/roadmap statements in this historical report.
 | `app-scope-global` | Allow sessions to non-local destinations (TCP/wire). |
 | `use-mq-eventfd` | Back MQ wakeups with an `eventfd` (cheaper than condvar; enables epoll on the MQ). |
 | `app-socket-api <path>` | Use the SAPI Unix socket at `<path>`. **Required for vclnet's attach flow.** |
-| `multi-thread-workers` | **VLS Mode 2**: each pthread that touches VLS becomes a real VCL worker with its own MQ. Required for true parallelism in Go. *Not* set today. |
+| `multi-thread-workers` | **VLS Mode 2**: each registered pthread becomes a VCL worker with its own MQ. Set only when selecting the vclnet Mode 2 worker pool. |
 | `huge_page` | Use hugepages for the segment baseva (perf). |
 | `tls-engine N` | Select TLS engine (mbedtls / openssl / etc). |
 | `app_original_dst` | Expose SO_ORIGINAL_DST (for transparent proxies). |
@@ -1254,17 +1183,20 @@ This enables the session layer and the SEQPACKET app-socket-api endpoint.
 
 | File | Purpose |
 | --- | --- |
-| `vclnet/vclnet.go` | Public `Init`, `Listen`, `ListenContext`, `ListenPacket`, `Dial`, `DialContext`, `DialTimeout`, `TCPListener`, `Shutdown`, `InstallSignalHandler` |
+| `vclnet/vclnet.go` | Public `Options`, `Init`, `InitWithOptions`, `Listen`, `ListenContext`, `ListenPacket`, `Dial`, `DialContext`, `DialTimeout`, `TCPListener`, `Shutdown`, `InstallSignalHandler` |
 | `vclnet/dialer.go` | `Dialer` struct, `DialContext`, Happy Eyeballs (`dialHappyEyeballs`, `interleaveAddrs`) |
 | `vclnet/conn.go` | `tcpConn` (`net.Conn`) — Read/Write/Close/deadlines |
-| `vclnet/udpconn.go` | `udpConn` (`net.Conn`; provisional `net.PacketConn`) — connected UDP is validated |
+| `vclnet/udpconn.go` | `udpConn` (`net.Conn`; provisional `net.PacketConn`) — connected UDP is validated in Mode 3 |
 | `vclnet/listener.go` | `tcpListener` (`net.Listener` with `AcceptContext`) — Accept/Close/doneCh |
 | `vclnet/shutdown.go` | `Shutdown()`, `ShutdownDone()`, `InstallSignalHandler()` |
 | `vclnet/transport.go` | `Transport()`, `DefaultTransport`, `NewHTTPClient()` — HTTP connection pooling |
 | `vclnet/addr.go` | Network parsing, DNS resolution, `resolveAddrs`, `resolveUDPAddr`, `isUDP` |
 | `vclnet/errors.go` | `*net.OpError` wrapping, `IsTimeout`, `IsConnectionRefused`, `IsConnectionReset` |
-| `vclnet/internal/vclpoll/cgo.go` | CGo bridge; TCP + UDP C helpers, split-connect, `pin()`, `workerRegistry`, `VCLError` |
-| `vclnet/internal/vclpoll/poller.go` | Shared poller goroutine, `pollWait`, `PollWaitContext`, `pollUnregister` |
+| `vclnet/internal/vclpoll/cgo.go` | CGo bridge, raw VLS helpers, Mode 3 pinning, address and error conversion |
+| `vclnet/internal/vclpoll/dispatch.go` | Stable package functions and one-time Mode 2 or Mode 3 selection |
+| `vclnet/internal/vclpoll/poller.go` | Mode 3 shared poller and exact waiter state |
+| `vclnet/internal/vclpoll/mode2.go` | Virtual handles, owner registry, and operation routing |
+| `vclnet/internal/vclpoll/worker.go` | Lifetime-pinned Mode 2 loops, per-worker epoll, waiters, and teardown |
 | `vclnet/examples/*` | Echo + HTTP servers/clients (drop-in for stdlib `net`) |
 | `vclnet/test/run_integration.sh` | Full integration harness (starts VPP, runs tests) |
 | `vclnet/docs/architecture.md` | Architecture + design rationale |
@@ -1317,18 +1249,24 @@ The three deep-dive questions are *the* questions for vclnet because they corres
 
 | Collision | Go's contract | VCL's contract | vclnet's mediation |
 | --- | --- | --- | --- |
-| **Threading** | Goroutines float across Ms; Ms come and go | All state keyed by `__thread`; pthread death triggers worker teardown | `runtime.LockOSThread` per call, `sync.Map` worker registry, eager worker-0 registration in `AppInit` |
+| **Threading** | Goroutines float across Ms; Ms come and go | State is keyed by `__thread`; pthread death tears down a worker | Mode 3 pins each call; Mode 2 uses fixed lifetime-pinned owner loops |
 | **FD identity** | `net.Conn` deliberately hides the FD; runtime poller owns FDs | `vlsh` is not a kernel FD and must never be passed to kernel syscalls | `vlsh` lives only inside `internal/vclpoll`; `tcpConn` never exposes it; no Go FD leakage possible |
-| **Blocking semantics** | `net.Conn.Read` blocks via `runtime.poller` (epoll on real FDs) which schedules other goroutines | `vls_read` blocks the calling pthread inside VCL/SHM polling | Non-blocking + shared poller parks goroutines on Go channels so Ms aren't held |
+| **Blocking semantics** | `net.Conn.Read` must park without consuming one M per connection | Blocking VLS would hold the calling pthread | Non-blocking calls plus selected readiness loops park callers on Go channels |
 
 The Frida attempts failed because they tried to *lie* to the Go runtime — claim a kernel FD that wasn't real, claim a syscall returned EAGAIN when the runtime poller couldn't process it, claim work was synchronous when really it queued on a single JS thread. Every lie eventually got called.
 
 **vclnet doesn't lie.** It accepts that:
 
 * The `vlsh` is not an FD → `net.Conn` is the right abstraction; expose that, hide vlsh.
-* The pthread is the unit of VCL identity → `LockOSThread` makes a goroutine *be* a pthread for the duration of a VCL call.
-* VPP's MQ events are not kernel events → don't try to feed them to `runtime.netpoll`; have your own poller and park goroutines on Go channels.
+* The pthread is the unit of VCL identity -> Mode 3 pins each immediate call,
+  while Mode 2 routes the call to a lifetime-pinned owner.
+* VPP MQ events are not kernel events -> keep them in the Mode 3 shared poller
+  or the Mode 2 owner epoll loops and park callers on Go channels.
 
 That is why vclnet is the production path and Frida wasn't: it draws the boundary between Go and VCL at exactly the place where both APIs are willing to cooperate (`net.Conn` ⇄ `LockOSThread`-pinned cgo), instead of trying to fuse them by deception.
 
-The normal VCL path can select cut-through when both apps and scopes permit it. The shared poller is implemented today. The remaining scaling work is a mode-2, session-affine worker architecture; performance claims still require a reproducible baseline.
+The normal VCL path can select cut-through when both apps and scopes permit it.
+Mode 3 and the session-affine Mode 2 TCP worker pool are both implemented; Mode
+2 UDP remains fail-fast pending a VPP cleanup fix, and Mode 2 remains opt-in
+while listener sharding, cleanup soak, CI history, and a reproducible
+performance baseline remain open.

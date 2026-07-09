@@ -1,4 +1,4 @@
-.PHONY: build clean test unit race vet lint fmt tidy shellcheck eol-check normalize-eol check integration multiworker pc pc-clean pc-verify pc-print
+.PHONY: build clean test unit race vet lint fmt tidy shellcheck eol-check normalize-eol check integration multiworker multiworker-mode2 pc pc-clean pc-verify pc-print
 
 EXAMPLES := $(wildcard examples/*)
 BINS     := $(foreach d,$(EXAMPLES),bin/$(notdir $(d)))
@@ -185,3 +185,6 @@ integration:
 VPP_WORKERS ?= 4
 multiworker:
 	sudo -E bash test/run_multiworker.sh $(VPP_WORKERS)
+
+multiworker-mode2:
+	sudo -E bash test/run_multiworker.sh --mode 2 $(VPP_WORKERS)

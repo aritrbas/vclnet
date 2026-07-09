@@ -8,16 +8,21 @@ earlier LD_PRELOAD/Frida experiments: Go's networking runtime issues kernel
 syscalls directly and cannot treat a VCL session handle as a kernel file
 descriptor.
 
-The current repository demonstrates a viable architecture for TCP and connected
-UDP. Its isolated VPP test harness covers IPv4, IPv6, HTTP/1.1, layered TLS,
+The current repository demonstrates a viable architecture for TCP in both VLS
+modes and connected UDP in the default Mode 3 path. Its isolated VPP test
+harness covers IPv4, IPv6, HTTP/1.1, layered TLS,
 context cancellation, live deadlines, concurrent reads/writes, shutdown, and
 VPP configured with multiple worker threads.
 
 It is not yet a generally distributable production library. The highest
-priority gaps are portable build/module packaging, automated VPP compatibility
-CI, and a decision on the incomplete unconnected-UDP API. Application-side VLS
-also remains serialized in mode 3; mode 2 requires a different, session-affine
-worker architecture.
+priority gaps are automated VPP compatibility CI, completion of Mode 2 rollout
+validation, and a decision on the incomplete unconnected-UDP API. Mode 3
+remains the compatibility default. An opt-in Mode 2 implementation now uses
+fixed, session-affine worker loops for application-side parallelism, but
+its rollout still requires sustained CI, listener sharding, soak testing, and a
+performance baseline. The pinned VPP 26.06 build crashes during Mode 2
+cut-through UDP cleanup, so Mode 2 rejects UDP before allocating VLS state and
+preserves `errors.Is(err, syscall.EOPNOTSUPP)`.
 
 The prioritized source of truth is
 [../summary.md](../summary.md#3-pending-work).
@@ -81,18 +86,19 @@ thread.
 
 ## 3. Current evidence
 
-The no-VPP suite has 129 top-level tests. The VPP-backed suites contain:
+The no-VPP suite has 141 top-level tests. The VPP-backed suites contain:
 
 - 26 runnable public-package single-worker tests;
 - 2 low-level VCL poll tests;
-- 5 multi-VPP-worker stress tests;
+- 5 multi-worker stress tests plus 2 Mode 2 ownership and UDP-rejection
+  invariant tests;
 - 1 intentionally skipped unconnected-UDP test;
 - 2 opt-in benchmarks.
 
 Covered behavior includes:
 
 - TCP IPv4/IPv6 connect, listen, accept, read, write, close;
-- connected UDP IPv4/IPv6;
+- connected UDP IPv4/IPv6 in Mode 3;
 - HTTP/1.1 requests, responses, keep-alive-configured requests, and the public client helper;
 - standard `crypto/tls` over a VCL-backed connection;
 - Happy Eyeballs on localhost;
@@ -111,8 +117,10 @@ release-build tree. This is local evidence, not yet a compatibility matrix.
 The repository does not currently establish:
 
 - correct arbitrary-peer `net.PacketConn` behavior;
-- VLS `multi-thread-workers` mode;
-- portable compilation outside the author's VPP tree;
+- safe Mode 2 UDP in the pinned VPP build;
+- sustained full-surface and soak validation of VLS Mode 2;
+- sharded Mode 2 listeners and accept fan-in;
+- clean-host packaging across supported distributions and VPP installs;
 - HTTP/2 or current gRPC interoperability;
 - native VCL TLS;
 - TCP half-close;
@@ -127,30 +135,28 @@ report.
 
 ## 5. Threading and scaling
 
-VCL stores worker state in pthread-local storage. VCLNET pins each goroutine for
-the duration of a VLS call and registers each encountered OS thread. Sessions
-are non-blocking; on EAGAIN the goroutine releases the thread and waits on a Go
-channel.
+The package now has two implementations behind one internal dispatcher.
 
-One permanent poller goroutine owns a VLS epoll instance. It tracks a union
-interest mask per session and independent waiters for reads and writes.
-Cancelling a deadline removes only that waiter, so another operation on the
-same connection stays registered.
+Mode 3 is the default compatibility path. It pins a calling goroutine for each
+immediate VLS call, registers encountered OS threads, and uses one permanently
+pinned shared VLS epoll poller. All threads share VCL worker 0, so calls remain
+serialized inside VLS.
 
-The current VCL configuration is mode 3:
+Mode 2 is opt-in through `InitWithOptions` or environment overrides and requires
+`multi-thread-workers` in `vcl.conf`. It creates N permanently pinned Go worker
+loops. Each owns one VCL worker, message queue, epoll handle, operation channel,
+and exact waiter set. Session creation is round-robin; every later operation is
+submitted to the owner. Only TCP sessions are admitted to this pool today; UDP
+returns `EOPNOTSUPP` before VLS allocation.
 
-- all application threads share one VCL worker;
-- VLS protects shared state with locks;
-- the design is correct for the tested loads;
-- calls serialize inside VLS.
+Raw VLS handles collide across worker-local pools, so Mode 2 maps a
+process-unique internal handle to `{owner, raw}`. Before each operation it
+checks the raw VCL worker index and rejects a mismatch before VLS can enter its
+migration or clone path. The current listener design keeps a listener and all
+of its accepts on one worker; per-worker listener sharding is a rollout item.
 
-A VPP process configured with `cpu { workers N }` can distribute VPP-side
-session work, but it does not remove application-side mode-3 serialization.
-
-Mode 2 (`multi-thread-workers`) gives each thread a VCL worker and message
-queue. The current shared poller cannot use it safely because the poller would
-touch sessions created by other workers. A future implementation needs fixed,
-permanently pinned event loops and session affinity.
+A VPP process configured with `cpu { workers N }` can distribute VPP-side work
+in either VLS mode. It does not by itself select application-side Mode 2.
 
 ## 6. Cut-through
 
@@ -177,13 +183,13 @@ A production performance report should capture raw data for:
 
 | Risk | Current mitigation | Remaining action |
 | --- | --- | --- |
-| Workstation-specific CGo/rpath | Known build works in this workspace | P0 portable discovery and clean build |
+| Clean-host packaging | pkg-config template and prefix-driven Make targets | Validate supported distro and container builds |
 | VPP API/behavior drift | Integration harness exercises local VPP | P0 automated version matrix |
-| Incomplete UDP surface | Connected UDP tested; unconnected test skipped | Implement adapter or deprecate API |
+| Incomplete UDP surface | Mode 3 connected UDP tested; unconnected test skipped | Implement adapter or deprecate API |
 | Connect failure ambiguity | Immediate hard failures are wrapped | Add reliable post-EPOLLOUT error query/tests |
-| Lifecycle races | Shutdown gates new work and wakes poller waits | Track/drain all live objects and soak test |
-| Application-side serialization | Mode 3 is correct and simple | Session-affine mode-2 redesign if data justifies it |
-| Debug-build cut-through cleanup race | Release build is used for validation | Reproduce/report upstream with a minimal case |
+| Lifecycle races | Shutdown gates new work and wakes dispatcher waits | Track/drain all live objects and soak test |
+| Mode 2 rollout risk | Session-affine pool, ownership preflight, dual-mode harness | Add listener sharding, full-surface soak, CI history, and performance baseline |
+| Mode 2 cut-through UDP crash | UDP fails before VLS allocation; harness probes VPP after tests | Produce and report a minimal reproducer; enable only on a verified-safe VPP build |
 | Unsupported ecosystem assumptions | Docs now distinguish tested vs inferred | Add HTTP/2/gRPC/application-specific tests |
 
 ## 8. Recommendation
@@ -193,18 +199,18 @@ explicit interface is materially more maintainable than syscall interception.
 
 Before broad production adoption:
 
-1. complete portable build/module packaging;
+1. validate clean-host and container packaging against supported VPP installs;
 2. put the isolated VPP suites in CI against pinned versions;
 3. resolve the `ListenPacket` contract;
 4. add application-protocol and lifecycle soak tests;
 5. collect a reproducible performance baseline;
-6. pursue VLS mode 2 only if measurements show mode-3 serialization is a
-   limiting factor.
+6. keep Mode 2 opt-in until sustained CI and measurements establish both
+   correctness and a useful gain over Mode 3.
 
-A narrower deployment can proceed earlier when its workload uses only the
-tested TCP or connected-UDP surface, pins the validated VPP build, runs the
-same integration suite, and accepts the documented limitations.
+A narrower deployment can proceed earlier when its workload uses the tested
+TCP surface in either mode, or connected UDP in Mode 3, pins the validated VPP
+build, runs the same integration suite, and accepts the documented limitations.
 
 ---
 
-Document status: audited 2026-07-08.
+Document status: audited 2026-07-09.

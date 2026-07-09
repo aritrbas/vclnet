@@ -44,8 +44,9 @@ vcl {
 }
 ```
 
-Do not add `multi-thread-workers`: the current shared poller is designed for
-VLS mode 3 and is not compatible with mode 2 session ownership.
+This configuration selects the default Mode 3 dispatcher. For opt-in Mode 2,
+add `multi-thread-workers` inside the `vcl` block and initialize with more than
+one worker. The application setting and VCL token must agree.
 
 ## 2. Initialize once
 
@@ -56,6 +57,22 @@ if err := vclnet.Init("my-service"); err != nil {
     log.Fatalf("initialize VCL: %v", err)
 }
 ```
+
+To opt into Mode 2:
+
+```go
+if err := vclnet.InitWithOptions("my-service", vclnet.Options{Workers: 4}); err != nil {
+    log.Fatalf("initialize VCL Mode 2: %v", err)
+}
+```
+
+The same selection can be made out of band with
+`VCLNET_VLS_MODE=2 VCLNET_WORKERS=4`. `VCLNET_VLS_MODE=3` forces the
+compatibility dispatcher. Environment values override `Options`; invalid values
+and a missing Mode 2 VCL token fail initialization.
+
+Mode 2 is currently TCP-only. Its UDP entry points return an error wrapping
+`syscall.EOPNOTSUPP` before creating VLS state; select Mode 3 for UDP workloads.
 
 Repeated calls are no-ops after the first result. After `Shutdown`, Init and
 new public network operations return `vclnet.ErrClosed`; reinitialization in
@@ -131,8 +148,7 @@ For `"tcp"`, addresses are interleaved IPv6/IPv4 and attempts are staggered
 by 250 ms by default. Configure it with `Dialer.FallbackDelay`.
 
 I/O deadlines follow the `net.Conn` contract for the tested paths: setting,
-clearing, or extending a deadline wakes an operation already waiting in the
-shared poller.
+clearing, or extending a deadline wakes an operation already parked in the selected readiness dispatcher.
 
 ```go
 if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
@@ -199,7 +215,7 @@ This layered `crypto/tls` path is integration-tested. Native VCL TLS
 
 ## 7. UDP
 
-Connected UDP is implemented and tested:
+Connected UDP is implemented and tested in Mode 3:
 
 ```go
 conn, err := vclnet.Dial("udp4", "10.0.0.1:53")
@@ -214,8 +230,10 @@ if _, err := conn.Write(query); err != nil {
 n, err := conn.Read(response)
 ```
 
-The connected UDP path supports IPv4, IPv6, context-aware connection setup,
-and resettable deadlines.
+The Mode 3 connected UDP path supports IPv4, IPv6, context-aware connection
+setup, and resettable deadlines. Mode 2 rejects UDP before VLS allocation with
+an error wrapping `syscall.EOPNOTSUPP` because the pinned VPP 26.06 build can
+crash during cut-through datagram cleanup.
 
 Do not adopt `ListenPacket` for arbitrary peers yet. VPP represents incoming
 UDP peers as sessions accepted from a UDP listener; vclnet does not yet provide
@@ -226,7 +244,8 @@ test is intentionally skipped.
 ## 8. Errors
 
 Public failures use `*net.OpError` and preserve wrapped context errors or
-`syscall.Errno` values.
+`syscall.Errno` values. Mode 2 UDP failures preserve
+`errors.Is(err, syscall.EOPNOTSUPP)`.
 
 ```go
 conn, err := vclnet.Dial("tcp4", "10.0.0.1:80")
@@ -248,22 +267,49 @@ _ = conn
 VLS handles are not kernel file descriptors. Code that requires `SyscallConn`,
 `File`, `splice`, or direct fd access is not compatible.
 
-## 9. Multi-worker VPP
+## 9. VPP workers and VLS modes
 
-A VPP process may use several packet/session worker threads:
+VPP-side session workers and application-side VLS workers are separate choices.
+A VPP process may use several packet and session workers:
 
 ```text
 cpu { workers 4 }
 session { enable use-app-socket-api }
 ```
 
-No application change is required, and the repository has a multi-worker stress
-suite. This does **not** make the VCL client parallel: vclnet still uses VLS
-mode 3, where calls share one VCL worker and serialize on VLS locks.
+Mode 3 is the default and needs no application change. All application threads
+share one VCL worker, so VLS state remains serialized even when VPP has several
+workers.
 
-The repository's `test/run_multiworker.sh` deliberately leaves
-`multi-thread-workers` out of `vcl.conf`. Mode 2 requires a future
-session-affine event-loop design.
+Mode 2 creates a fixed application worker pool:
+
+```text
+vcl {
+  multi-thread-workers
+  # normal FIFO, scope, eventfd, and app-socket settings
+}
+```
+
+```go
+err := vclnet.InitWithOptions("my-service", vclnet.Options{Workers: 4})
+```
+
+Each worker is a lifetime-pinned goroutine with its own VCL worker, message
+queue, epoll handle, operation queue, and waiter map. Session creation is
+round-robin and every later operation is routed to the owner. Mode 2 uses one
+owner per listener in the current v1 design; listener sharding is pending.
+Only TCP sessions enter this pool on the pinned VPP build. Use Mode 3 if the
+application requires UDP.
+
+Validate both paths with:
+
+```bash
+sudo -E bash test/run_multiworker.sh --mode 3 4
+sudo -E bash test/run_multiworker.sh --mode 2 4
+```
+
+Mode 2 is experimental and opt-in until its CI soak and performance rollout
+gates in [../summary.md](../summary.md#3-pending-work) are complete.
 
 ## 10. Containers and deployment
 
@@ -313,11 +359,13 @@ image places the VPP libraries elsewhere.
 Before rollout:
 
 1. Run `go test -race -count=1 ./...`, `go vet ./...`, and `make build`.
-2. Run `sudo bash test/run_integration.sh` against the exact VPP build.
-3. Run `sudo bash test/run_multiworker.sh N` with the production worker count.
+2. Run `sudo -E bash test/run_integration.sh` against the exact VPP build.
+3. Run `sudo -E bash test/run_multiworker.sh --mode 3 N` and
+   `sudo -E bash test/run_multiworker.sh --mode 2 N` with the production worker
+   count.
 4. Add application-specific protocol, load, timeout, and shutdown tests.
-5. Confirm the workload does not require unconnected UDP, fd extraction,
-   half-close, native VCL TLS, HTTP/2, or untested gRPC behavior.
+5. Confirm the workload does not require unconnected UDP, Mode 2 UDP, fd
+   extraction, half-close, native VCL TLS, HTTP/2, or untested gRPC behavior.
 6. Measure performance on the real topology; do not reuse illustrative latency
    numbers from unrelated VPP deployments.
 7. Pin and document the VPP/Go/library versions used for release.

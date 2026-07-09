@@ -1678,3 +1678,42 @@ func TestListenPacketPortZeroRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveInitOptions(t *testing.T) {
+	tests := []struct {
+		name        string
+		opts        Options
+		env         map[string]string
+		wantMode    vclpoll.Mode
+		wantWorkers int
+		wantErr     bool
+	}{
+		{name: "default", opts: Options{}, wantMode: vclpoll.Mode3, wantWorkers: 1},
+		{name: "explicit pool", opts: Options{Workers: 4}, wantMode: vclpoll.Mode2, wantWorkers: 4},
+		{name: "environment mode2", opts: Options{Workers: 1}, env: map[string]string{"VCLNET_VLS_MODE": "2", "VCLNET_WORKERS": "3"}, wantMode: vclpoll.Mode2, wantWorkers: 3},
+		{name: "environment mode3 override", opts: Options{Workers: 4}, env: map[string]string{"VCLNET_VLS_MODE": "3"}, wantMode: vclpoll.Mode3, wantWorkers: 4},
+		{name: "workers env implies pool", env: map[string]string{"VCLNET_WORKERS": "2"}, wantMode: vclpoll.Mode2, wantWorkers: 2},
+		{name: "negative option", opts: Options{Workers: -1}, wantErr: true},
+		{name: "invalid mode", env: map[string]string{"VCLNET_VLS_MODE": "7"}, wantErr: true},
+		{name: "invalid workers", env: map[string]string{"VCLNET_WORKERS": "zero"}, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lookup := func(key string) (string, bool) {
+				value, ok := tt.env[key]
+				return value, ok
+			}
+			mode, workers, err := resolveInitOptions(tt.opts, lookup)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("error=%v, wantErr=%v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if mode != tt.wantMode || workers != tt.wantWorkers {
+				t.Fatalf("got mode=%d workers=%d, want mode=%d workers=%d", mode, workers, tt.wantMode, tt.wantWorkers)
+			}
+		})
+	}
+}

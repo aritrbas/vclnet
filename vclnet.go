@@ -6,6 +6,8 @@
 // typically just replacing "net" with "vclnet" in the import path.
 //
 // Supported networks: "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6".
+// UDP requires VLS Mode 3; Mode 2 returns an error wrapping
+// syscall.EOPNOTSUPP before allocating a VLS datagram session.
 //
 // Before using any vclnet function, the calling process must have VPP
 // running with the session layer enabled, and VCL_CONFIG must point to a
@@ -14,7 +16,10 @@ package vclnet
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/aritrbas/vclnet/internal/vclpoll"
@@ -22,14 +27,65 @@ import (
 
 const defaultBacklog = 128
 
-// Init initializes the VCL application layer. Must be called once before
-// Listen or Dial. The appName identifies this process to VPP.
-// It is safe to call multiple times; subsequent calls are no-ops.
+// Options controls VCL worker selection during initialization. Workers 0 or 1
+// preserves the mode-3 shared-worker implementation. Workers > 1 selects the
+// experimental mode-2 session-affine worker pool.
+type Options struct {
+	Workers int
+}
+
+// Init initializes the VCL application layer with mode-3 compatibility by
+// default. Environment overrides are honored by InitWithOptions.
 func Init(appName string) error {
+	return InitWithOptions(appName, Options{Workers: 1})
+}
+
+// InitWithOptions initializes VCL with an explicit worker count. Environment
+// variables VCLNET_VLS_MODE (2 or 3) and VCLNET_WORKERS override opts so CI
+// and deployments can select a mode without changing application code.
+func InitWithOptions(appName string, opts Options) error {
 	if shutdownStarted.Load() {
 		return ErrClosed
 	}
-	return vclpoll.AppInit(appName)
+	mode, workers, err := resolveInitOptions(opts, os.LookupEnv)
+	if err != nil {
+		return err
+	}
+	return vclpoll.AppInitWithOptions(appName, vclpoll.InitOptions{Mode: mode, Workers: workers})
+}
+
+func resolveInitOptions(opts Options, lookupEnv func(string) (string, bool)) (vclpoll.Mode, int, error) {
+	workers := opts.Workers
+	if workers == 0 {
+		workers = 1
+	}
+	if workers < 0 {
+		return 0, 0, fmt.Errorf("vclnet: Workers must be >= 0")
+	}
+
+	if value, ok := lookupEnv("VCLNET_WORKERS"); ok {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 {
+			return 0, 0, fmt.Errorf("vclnet: invalid VCLNET_WORKERS %q", value)
+		}
+		workers = parsed
+	}
+
+	mode := vclpoll.Mode3
+	if workers > 1 {
+		mode = vclpoll.Mode2
+	}
+	if value, ok := lookupEnv("VCLNET_VLS_MODE"); ok {
+		switch value {
+		case "2":
+			mode = vclpoll.Mode2
+		case "3":
+			mode = vclpoll.Mode3
+		default:
+			return 0, 0, fmt.Errorf("vclnet: invalid VCLNET_VLS_MODE %q (want 2 or 3)", value)
+		}
+	}
+	return mode, workers, nil
 }
 
 // Listen announces on the local network address.
@@ -96,9 +152,10 @@ func Listen(network, address string) (net.Listener, error) {
 	return newTCPListener(vlsh, addr, network), nil
 }
 
-// ListenPacket creates a provisional VLS UDP listener. Connected UDP via
-// Dial is supported; arbitrary-peer PacketConn semantics are not yet
-// implemented end to end (see summary.md).
+// ListenPacket creates a provisional VLS UDP listener in Mode 3. Mode 2
+// returns an error wrapping syscall.EOPNOTSUPP before VLS allocation.
+// Connected UDP via Dial is supported in Mode 3; arbitrary-peer PacketConn
+// semantics are not yet implemented end to end (see summary.md).
 //
 // The network must be "udp", "udp4", or "udp6".
 //
@@ -165,6 +222,8 @@ func ListenPacket(network, address string) (net.PacketConn, error) {
 // context's deadline and cancellation.
 //
 // Supported networks: "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6".
+// UDP requires VLS Mode 3; Mode 2 returns an error wrapping
+// syscall.EOPNOTSUPP.
 //
 // For "tcp" (no suffix), DialContext uses RFC 6555 Happy Eyeballs to try
 // both IPv4 and IPv6 concurrently.
@@ -176,6 +235,8 @@ func DialContext(ctx context.Context, network, address string) (net.Conn, error)
 // Dial connects to the address on the named network.
 //
 // Supported networks: "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6".
+// UDP requires VLS Mode 3; Mode 2 returns an error wrapping
+// syscall.EOPNOTSUPP.
 //
 // Examples:
 //
