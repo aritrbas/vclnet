@@ -704,14 +704,20 @@ Since VPP does not ship a `.pc` file today, the repository provides `pkgconfig/v
 
 The public package currently exposes initialization and shutdown, TCP
 listen/dial APIs, provisional UDP `ListenPacket`, connected UDP dialing,
-context-aware dialing and accept, an HTTP transport/client, and error
-classification helpers. See the API list in [../README.md](../README.md).
+context-aware dialing and accept, native VCL TLS (`DialTLS` / `ListenTLS`,
+described in [§12.5](#125-native-vcl-tls-vppcom_proto_tls)), an HTTP
+transport/client, and error classification helpers. See the API list in
+[../README.md](../README.md).
 
-The TCP connection implements `Read`, `Write`, `Close`, address access,
-and resettable deadlines. Deadline changes wake an operation already parked in the selected readiness
-dispatcher. The UDP connection implements connected `net.Conn`
-behavior; its arbitrary-peer `PacketConn` behavior remains incomplete because
-VPP accepts incoming UDP peers as separate sessions.
+The TCP connection implements `Read`, `Write`, `Close`, `CloseRead`,
+`CloseWrite`, address access, and resettable deadlines. Deadline changes
+wake an operation already parked in the selected readiness dispatcher.
+`CloseRead` and `CloseWrite` map to `vls_shutdown(SHUT_RD)` and
+`vls_shutdown(SHUT_WR)` respectively and are described in
+[§12.4](#124-tcp-half-close-and-vls_shutdown). The UDP connection implements
+connected `net.Conn` behavior; its arbitrary-peer `PacketConn` behavior
+remains incomplete because VPP accepts incoming UDP peers as separate
+sessions.
 
 The listener implementation supports both `Accept` and
 `AcceptContext`. Context expiry, listener close, and package shutdown remain
@@ -815,6 +821,158 @@ Neither design holds one OS thread per blocked connection. Mode 3 uses one
 readiness thread for all sessions. Mode 2 uses the fixed worker count chosen at
 initialization. Application goroutines remain ordinary schedulable goroutines
 while parked on channels.
+
+### 12.4 TCP half-close and `vls_shutdown`
+
+`net.TCPConn` exposes independent `CloseRead` and `CloseWrite` methods so
+protocols such as HTTP/1.1, gRPC, and interactive shells can signal
+end-of-input without tearing the connection down. vclnet reaches parity via
+`vls_shutdown(vlsh, how)`, which routes into `vppcom_session_shutdown`:
+
+* **`SHUT_RD`** sets `VCL_SESSION_F_RD_SHUTDOWN` on the local session record.
+  It does not emit anything on the wire — VPP keeps ACKing incoming data so
+  the peer is unaware. Subsequent local reads return zero once the receive
+  FIFO drains. This is the standard POSIX semantic and matches
+  `net.TCPConn.CloseRead`.
+* **`SHUT_WR`** sets `VCL_SESSION_F_WR_SHUTDOWN` and queues a
+  `SESSION_CTRL_EVT_SHUTDOWN` message to VPP; the peer's session state
+  transitions and it observes a normal FIN → zero-byte read on its side.
+  Subsequent local writes are rejected by `vppcom_session_write` with
+  `VPPCOM_EPIPE`.
+
+Two consequences shape the vclnet implementation:
+
+1. **VPP does not epoll-wake locally-issued shutdowns.** `SHUT_RD` never
+   emits an EPOLLIN/EPOLLHUP for the caller (because VPP considers the wire
+   still active). `SHUT_WR` also does not synthesize an EPOLLOUT for the
+   caller. If a reader or writer is already parked on the shared or worker
+   epoll, it will not be woken by `vls_shutdown` alone. vclnet therefore
+   drives the wake through the same channel that deadline expiry uses:
+   `readDeadline.interrupt()` / `writeDeadline.interrupt()` close the wait
+   channel, the parked I/O returns `ErrWaitCanceled`, the retry loop
+   observes `readShutdown` / `writeShutdown`, and returns `io.EOF` or
+   `net.ErrClosed` respectively — never a spurious `i/o timeout`.
+2. **The half-close is a call, not a close.** The `vlsh` remains valid and
+   registered with the readiness dispatcher. Only a subsequent `Close()`
+   (which the codebase always calls, since `net.Conn` docs require it)
+   invokes `vls_close`. This keeps the invariant that
+   `closed → vls_close was called exactly once` intact.
+
+Dispatch-mode plumbing:
+
+* Mode 3 goes through `mode3Shutdown` which pins the calling goroutine,
+  takes the shared `vlsMu.RLock()`, and calls `rawShutdown`.
+* Mode 2 submits an op to the owner worker, so `vls_shutdown` executes on
+  the same pinned OS thread that already owns the raw handle. Ownership
+  preflight is applied identically to reads/writes.
+
+Error shape:
+
+* `Read` after `CloseRead` returns `(0, io.EOF)` unwrapped, matching
+  `net.TCPConn`.
+* `Write` after `CloseWrite` returns `*net.OpError{Err: net.ErrClosed}`
+  with `Op == "write"`. Callers can use `errors.Is(err, net.ErrClosed)`.
+* `CloseRead` / `CloseWrite` after `Close` return `*net.OpError{Err:
+  net.ErrClosed}` with `Op == "close"`. Multiple half-close calls are
+  idempotent via `sync.Once`.
+
+Listeners cannot be half-closed. `vppcom_session_shutdown` rejects
+`VCL_STATE_LISTEN` with `VPPCOM_EBADFD`; vclnet does not expose the
+methods on `TCPListener`.
+
+### 12.5 Native VCL TLS (`VPPCOM_PROTO_TLS`)
+
+VPP's session layer includes an in-tree TLS engine (OpenSSL by default,
+picotls optional). When an application creates a session with
+`VPPCOM_PROTO_TLS`, VPP performs the handshake, per-record encryption, and
+alert handling; the application only ever sees decrypted application bytes
+in the SVM FIFO. This is architecturally different from layering `crypto/tls`
+on top of a plain `vclnet.Conn`, which reads ciphertext across the SVM FIFO
+and decrypts it in userspace.
+
+vclnet exposes this path through three public entry points:
+
+```go
+type TLSConfig struct {
+    Cert []byte // PEM (leaf + optional chain)
+    Key  []byte // PEM (matching private key)
+}
+func DialTLS(network, address string, cfg *TLSConfig) (net.Conn, error)
+func DialTLSContext(ctx context.Context, network, address string, cfg *TLSConfig) (net.Conn, error)
+func ListenTLS(network, address string, cfg *TLSConfig) (net.Listener, error)
+```
+
+Wire-level plumbing:
+
+1. **Cert registration.** `vppcom_add_cert_key_pair` copies the PEM bytes
+   into VPP's cert store and returns a process-global `ckpair_index`
+   (>= 0). vclnet exposes this through `vclpoll.AddCertKeyPair`, which
+   pins the calling thread in Mode 3 and submits to a worker in Mode 2 so
+   the CGo call runs against a registered VCL worker.
+2. **Deduplication.** `TLSConfig` uses a `sync.Once` plus a
+   package-level `map[SHA-256(cert‖key)]uint32` to make repeated
+   `DialTLS(cfg)` / `ListenTLS(cfg)` calls with byte-identical Cert/Key
+   share one ckpair entry, so long-running apps do not grow VPP's cert
+   store unbounded. The concurrent-registration race (two goroutines
+   register the same PEM at the same time) is resolved by keeping the
+   earlier index and releasing the loser via `vppcom_del_cert_key_pair`.
+3. **Session setup.** For both server and client, vclnet issues a
+   single-CGo-call sequence: `vls_create(VPPCOM_PROTO_TLS, 1) →
+   vls_attr(VPPCOM_ATTR_SET_CKPAIR) → vls_bind/vls_listen or vls_connect`.
+   On any failure the vlsh is closed before the errno propagates back to
+   Go. Clients with no `Cert`/`Key` skip `SET_CKPAIR` entirely so VPP
+   falls back to `ckpair_index = 0` (anonymous client). Servers must
+   present a cert; `ListenTLS` returns `ErrTLSMissingCert` otherwise.
+4. **Handshake wait.** VPP's TLS handshake completes asynchronously —
+   `vls_connect` returns `-EINPROGRESS`, and the readiness dispatcher
+   waits for `EPOLLOUT` on the underlying VLS handle. That EPOLLOUT fires
+   only once the negotiated session is fully ready for application data,
+   so the caller's `ctx.Done()` correctly bounds the entire handshake.
+5. **Data path.** After handshake, `Read` / `Write` on the returned
+   `net.Conn` traverse `vls_read` / `vls_write` exactly as for plain TCP.
+   VPP decrypts and re-encrypts per record entirely inside the session
+   layer; there is no additional Go-visible framing.
+
+Wire semantics and observable contrast with layered `crypto/tls`:
+
+* **Handshake location.** With `DialTLS`, the ClientHello is emitted by
+  VPP; the Go binary never touches ciphertext. With `crypto/tls` layered
+  on `vclnet.Dial`, ciphertext crosses the SVM FIFO between VPP and Go for
+  every record.
+* **Feature surface.** vclnet's `TLSConfig` currently maps only what
+  `VPPCOM_ATTR_SET_CKPAIR` reaches: cert, key, and the engine chosen in
+  `vcl.conf`. SNI matching, ALPN, cert verification hooks, session
+  ticket lifetimes, and key logging are all `crypto/tls` features that
+  require the layered path today. Reaching them via native TLS would need
+  `VPPCOM_ATTR_SET_ENDPT_EXT_CFG` and richer `TLSConfig` fields; that is
+  tracked as a P2 item in [../summary.md](../summary.md#3-pending-work).
+* **Failure surface.** A cert misconfiguration returns a Go-level error
+  (`ErrTLSMissingCert`, `ErrTLSPartialCert`) before any CGo call. VPP
+  handshake failures come back as `syscall.Errno`-wrapped
+  `*net.OpError`s from the underlying `vls_connect` / EPOLLOUT wait.
+
+Dispatch-mode plumbing:
+
+* Mode 3 pins the calling goroutine, takes `vlsMu.RLock()`, and calls the
+  raw C helper.
+* Mode 2 routes the entire `create + SET_CKPAIR + bind/listen or connect`
+  sequence to a round-robin worker; the accepted session inherits the
+  listener's owner exactly as for plain TCP, so no ownership migration is
+  required for TLS-terminated inbound traffic.
+
+Test coverage:
+
+* Unit contract tests (`tls_test.go`): server-side cert requirement,
+  client-side anonymous mode, partial-config rejection, UDP-network
+  rejection, unknown-network rejection, canceled-context short-circuit,
+  hash-based ckpair dedup, and big-endian length prefixing.
+* VPP-backed integration (`integration_test.go`):
+  `TestNativeVCLTLSEchoSingle` (short echo through `nativetls` child
+  server), `TestNativeVCLTLSEchoLarge` (128 KiB round-trip across TLS
+  record boundaries), `TestNativeVCLTLSVsLayeredTLSFunctionalParity`
+  (both stacks satisfy the same functional round-trip contract), and
+  `TestNativeVCLTLSListenValidation` (no VPP required — validates the
+  config-check short-circuit).
 
 ## 13. Earlier Attempts: Why Frida-Based Approaches Failed
 
@@ -1153,7 +1311,13 @@ fixed build are required before Mode 2 UDP can be enabled.
 ### 15.3 Architectural caveats (not bugs)
 
 * **Single VLS app per process** — VPP cannot route a `connect()` to a `listen()` in the same VLS app. Client and server **must** be separate processes (tests use a self-reexec pattern with `VCLNET_TEST_SERVER_MODE=1`).
-* **No TLS in vclnet itself** — TLS must layer on top via `crypto/tls.Server(conn, cfg)`. The underlying VCL also supports TLS as a transport (`VPPCOM_PROTO_TLS`); a future phase can expose that.
+* **Two TLS paths, different trade-offs** — vclnet supports both native VCL
+  TLS via `DialTLS`/`ListenTLS` (VPP terminates TLS with its OpenSSL engine
+  via `VPPCOM_PROTO_TLS`) and standard `crypto/tls` layered on a plain
+  `net.Conn`. The layered path retains the full Go TLS surface (SNI matching,
+  verify callbacks, ALPN, session tickets, key logging); the native path
+  currently reaches only cert/key via `VPPCOM_ATTR_SET_CKPAIR`. See
+  [§12.5](#125-native-vcl-tls-vppcom_proto_tls) for details.
 
 ---
 
@@ -1161,18 +1325,20 @@ fixed build are required before Mode 2 UDP can be enabled.
 
 The implementation covers TCP on IPv4 and IPv6 in both modes and connected UDP
 in Mode 3, plus context-aware connect and accept, resettable deadlines,
-HTTP/1.1, layered TLS, shutdown, and multi-VPP-worker stress. Mode 3 remains the
-default compatibility dispatcher. Mode 2 is implemented as an opt-in,
-session-affine TCP worker pool with per-worker epoll, virtual handles,
-ownership preflight, exact cancellation, ordered teardown, and fail-fast UDP
-rejection.
+HTTP/1.1, layered TLS, native VCL TLS (`DialTLS`/`ListenTLS` on top of
+`VPPCOM_PROTO_TLS`), shutdown, TCP half-close, and multi-VPP-worker stress.
+Mode 3 remains the default compatibility dispatcher. Mode 2 is implemented as
+an opt-in, session-affine TCP worker pool with per-worker epoll, virtual
+handles, ownership preflight, exact cancellation, ordered teardown, and
+fail-fast UDP rejection.
 
 It is not accurate to describe the library as production-complete. Unconnected
 UDP `PacketConn` semantics are incomplete. Mode 2 UDP is disabled pending a VPP
 cleanup fix, and Mode 2 still needs sustained supported-surface and teardown
 soak, sharded listeners, CI history, and a reproducible performance baseline
-before it can become the default. HTTP/2, current gRPC,
-native VCL TLS, half-close, and a VPP version matrix also remain open.
+before it can become the default. HTTP/2, current gRPC, extended native TLS
+controls (SNI, ALPN, verify hooks via `SET_ENDPT_EXT_CFG`), and a VPP version
+matrix also remain open.
 
 The canonical prioritized list is
 [../summary.md](../summary.md#3-pending-work). It supersedes older roadmap

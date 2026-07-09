@@ -11,14 +11,16 @@ VCL worker.
 
 | Area | Current behavior | Validation |
 | --- | --- | --- |
-| TCP | Listen, accept, dial, read, write, close on IPv4 and IPv6 | Unit plus VPP integration |
+| TCP | Listen, accept, dial, read, write, close, and half-close on IPv4 and IPv6 | Unit plus VPP integration |
+| TCP half-close | `CloseRead` and `CloseWrite` route to `vls_shutdown(SHUT_RD/SHUT_WR)`; SHUT_WR emits a peer FIN, SHUT_RD is local-only. Parity with `net.TCPConn` error shapes | Unit state tests plus VPP integration (`halfclose` server, wake-parked-writer) |
 | Context dialing | TCP in both modes and connected UDP in Mode 3 honor cancellation while resolving or connecting | Unit plus VPP integration for successful paths |
 | Happy Eyeballs | Unsuffixed `"tcp"` interleaves IPv6 and IPv4 attempts with a configurable stagger and closes successful losers | Localhost VPP integration plus helper tests |
 | Deadlines | Resettable read and write deadlines wake operations already parked for readiness | Timer unit tests plus TCP and Mode 3 UDP VPP integration |
 | Concurrent I/O | One session can retain separate read and write waiters | Readiness state-machine tests plus 6 MiB TCP integration |
 | Listener cancellation | `TCPListener.AcceptContext` distinguishes context expiry from listener or package close | Unit plus VPP integration |
 | Connected UDP | `Dial("udp*")`, read, write, and deadlines on IPv4 and IPv6 in Mode 3; Mode 2 fails before allocation with `EOPNOTSUPP` | VPP integration plus Mode 2 rejection tests |
-| HTTP and TLS | HTTP/1.1 and standard `crypto/tls` over vclnet TCP | VPP integration |
+| HTTP and layered TLS | HTTP/1.1 and standard `crypto/tls` over vclnet TCP | VPP integration |
+| Native VCL TLS | `DialTLS` / `ListenTLS` route TLS termination into VPP via `VPPCOM_PROTO_TLS` (OpenSSL engine, `vppcom_add_cert_key_pair` + `SET_CKPAIR`). No `crypto/tls` on the caller side | Unit config + VPP integration (echo, 128 KiB fragmentation, layered/native parity) |
 | Shutdown | Idempotent, wakes parked operations, stops VLS workers, and rejects later operations | Unit and subprocess VPP integration |
 | VLS Mode 3 | Shared VCL worker with one persistent readiness poller | Default; standard and multi-VPP-worker harnesses |
 | VLS Mode 2 | N pinned VCL workers, per-worker epoll, virtual process-wide handles, ownership preflight, and no shared poller; TCP only for the pinned VPP build | Opt-in; unit tests and multi-worker TCP, IPv6, HTTP, ownership, and UDP-rejection stress |
@@ -66,16 +68,24 @@ gaps remain release blockers:
 
 ## 2. Test inventory
 
-The repository currently has 141 top-level no-VPP tests:
+The repository currently has 165 top-level no-VPP tests:
 
-- 118 public-package contract and unit tests;
+- 142 public-package contract and unit tests (adds 13 native VCL TLS
+  contract tests covering server-side cert requirement, client-side
+  anonymous mode, partial-config rejection, UDP-network rejection,
+  unknown-network rejection, canceled-context short-circuit, hash-based
+  ckpair dedup, and big-endian length prefixing);
 - 9 shared Mode 3 poller tests;
 - 11 Mode 2 worker, ownership, parking, UDP rejection, and shutdown tests;
 - 3 byte-order and errno helper tests.
 
 VPP-backed coverage currently has:
 
-- 26 runnable public-package tests in the standard integration harness;
+- 33 runnable public-package tests in the standard integration harness
+  (adds `TestNativeVCLTLSEchoSingle`, `TestNativeVCLTLSEchoLarge`,
+  `TestNativeVCLTLSVsLayeredTLSFunctionalParity`, and
+  `TestNativeVCLTLSListenValidation` on top of the existing half-close and
+  layered-TLS tests);
 - 1 deliberately skipped unconnected-UDP `PacketConn` test;
 - 2 low-level vclpoll echo tests;
 - 5 multi-worker stress tests plus 2 Mode 2 ownership and UDP-rejection
@@ -83,9 +93,12 @@ VPP-backed coverage currently has:
 - 2 opt-in benchmarks.
 
 The standard harness exercises TCP IPv4 and IPv6, connected UDP IPv4 and IPv6,
-HTTP, layered TLS, Happy Eyeballs, context-aware accept, deadline expiry and
-updates, close-unblock behavior, simultaneous blocked read and write, address
-reporting, and shutdown.
+HTTP, layered TLS, native VCL TLS (short and 128 KiB fragmented echo plus a
+native-vs-layered parity test), Happy Eyeballs, context-aware accept,
+deadline expiry and updates, close-unblock behavior, simultaneous blocked
+read and write, address reporting, shutdown, and TCP half-close (both
+`CloseWrite` peer-EOF and `CloseRead` local-EOF paths, plus parked-writer
+wake-up).
 
 Commands:
 
@@ -119,8 +132,7 @@ maintaining independent roadmaps.
 | P1 | Verify asynchronous connect completion errors | Replace the EPOLLOUT-implies-success assumption when VPP exposes a reliable session error query, and add refused and unreachable integration cases |
 | P1 | Establish reproducible performance baselines | Record topology, hardware, VPP and kernel configs, payload and concurrency distributions, raw benchmark output, and comparisons before publishing speedup claims |
 | P1 | Harden lifecycle and graceful drain | Track live listeners and connections, define graceful-drain ordering, and stress concurrent Shutdown with active reads, writes, accepts, and dials |
-| P2 | Native VCL TLS | Expose `VPPCOM_PROTO_TLS` plus certificate and key configuration and compare it with layered `crypto/tls` |
-| P2 | TCP half-close | Add and test `CloseRead` and `CloseWrite` using VCL shutdown semantics |
+| P2 | Extended native TLS controls | Reach the rest of VPP's `TRANSPORT_ENDPT_EXT_CFG_CRYPTO` surface — SNI, ALPN, `verify_cfg`, `ca_trust_index`, `tls_profile_index` — via `VPPCOM_ATTR_SET_ENDPT_EXT_CFG`, and expose them on `TLSConfig` |
 | P2 | UDP edge semantics | Decide port-zero listeners, zero-length datagrams, truncation, connected `WriteTo`, multicast and broadcast, and source-address behavior |
 | P2 | Wider protocol validation | Add HTTP/2 and current gRPC integration tests before claiming those stacks are supported |
 

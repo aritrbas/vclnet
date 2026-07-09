@@ -54,8 +54,8 @@ The canonical, prioritized pending-work list is in
 | Unconnected UDP via `ListenPacket` | Provisional; not end-to-end supported |
 | `Transport` / `NewHTTPClient` | HTTP/1.1 integration covered |
 | `crypto/tls` layered over a vclnet TCP connection | Integrated |
-| Native VCL TLS | Not implemented |
-| TCP `CloseRead` / `CloseWrite` | Not implemented |
+| Native VCL TLS (`VPPCOM_PROTO_TLS`) via `DialTLS` / `ListenTLS` | Integrated; VPP terminates TLS, no `crypto/tls` on the caller side |
+| TCP `CloseRead` / `CloseWrite` | Integrated via `vls_shutdown` (SHUT_RD is local-only EOF; SHUT_WR sends a peer FIN) |
 
 DNS resolution uses Go's normal resolver. Only the connection data path is
 routed through VPP.
@@ -130,6 +130,85 @@ Connected UDP currently requires Mode 3.
 Do not use the classic unconnected `ListenPacket` receive loop yet; see the
 pending-work list.
 
+TCP half-close:
+
+```go
+conn, err := vclnet.Dial("tcp", "backend.example:8080")
+if err != nil {
+    // handle error
+}
+defer conn.Close()
+
+if _, err := conn.Write(request); err != nil {
+    // handle error
+}
+
+// Signal end-of-request over the wire. The peer's Read observes EOF; the
+// local read half stays open so the response can still be received.
+if hc, ok := conn.(interface{ CloseWrite() error }); ok {
+    if err := hc.CloseWrite(); err != nil {
+        // handle error
+    }
+}
+
+body, err := io.ReadAll(conn)
+_ = body
+_ = err
+```
+
+`CloseRead` / `CloseWrite` are discovered via anonymous interfaces just as with
+`net.TCPConn`, so idioms in `net/http`, `crypto/tls`, and third-party code
+work unchanged. `CloseWrite` returns `net.ErrClosed` on subsequent `Write`
+calls; `CloseRead` returns `io.EOF` (bare) on subsequent `Read` calls.
+
+Native VCL TLS (`VPPCOM_PROTO_TLS`) — VPP terminates TLS inside the session
+layer using its own crypto engine (OpenSSL by default). The `net.Conn`
+returned by `DialTLS`/`ListenTLS` already speaks cleartext application data;
+do **not** wrap it in `crypto/tls`.
+
+```go
+ln, err := vclnet.ListenTLS("tcp4", ":8443", &vclnet.TLSConfig{
+    Cert: certPEM, // PEM-encoded leaf (+ optional chain)
+    Key:  keyPEM,  // PEM-encoded matching private key
+})
+if err != nil {
+    // handle error
+}
+defer ln.Close()
+
+for {
+    conn, err := ln.Accept()
+    if err != nil {
+        // handle error
+    }
+    go handle(conn) // conn already carries decrypted application data
+}
+```
+
+Client side:
+
+```go
+conn, err := vclnet.DialTLS("tcp4", "backend.example:8443", nil) // anonymous client
+if err != nil {
+    // handle error
+}
+defer conn.Close()
+_, _ = conn.Write([]byte("GET / HTTP/1.0\r\n\r\n"))
+```
+
+Trade-offs vs layered `crypto/tls`:
+
+- Native VCL TLS eliminates the crypto/tls ↔ vclnet copy per record and
+  keeps ciphertext inside VPP's SVM FIFOs.
+- Layered `crypto/tls` still works over a plain `vclnet.Dial` / `Listen` and
+  gives you the full Go TLS surface: SNI matching, cert verification hooks,
+  session tickets, key logging, ALPN, etc. Use it whenever you need
+  behaviour that VPP's ext-config surface does not yet expose.
+- The `TLSConfig` in vclnet intentionally exposes only the minimum needed
+  by `vppcom_add_cert_key_pair` + `VPPCOM_ATTR_SET_CKPAIR`. Richer
+  configuration (SNI matching, verify callbacks, ALPN) is on the
+  pending-work list and would require plumbing `VPPCOM_ATTR_SET_ENDPT_EXT_CFG`.
+
 ## Public API
 
 ```go
@@ -160,6 +239,16 @@ func (l *TCPListener) Addr() net.Addr
 func Transport(d *Dialer) *http.Transport
 func NewHTTPClient() *http.Client
 var DefaultTransport *http.Transport
+
+type TLSConfig struct {
+    Cert []byte // PEM-encoded certificate (chain)
+    Key  []byte // PEM-encoded matching private key
+}
+func DialTLS(network, address string, cfg *TLSConfig) (net.Conn, error)
+func DialTLSContext(ctx context.Context, network, address string, cfg *TLSConfig) (net.Conn, error)
+func ListenTLS(network, address string, cfg *TLSConfig) (net.Listener, error)
+var ErrTLSMissingCert error
+var ErrTLSPartialCert error
 
 func Shutdown()
 func ShutdownDone() <-chan struct{}

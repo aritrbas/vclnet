@@ -256,6 +256,49 @@ func (d *mode2Dispatcher) connectTCP6Start(ip [16]byte, port uint16) (VLSH, bool
 	return d.createConnect(func() (VLSH, bool, error) { return mode3ConnectTCP6Start(ip, port) })
 }
 
+// addCertKeyPair routes VPP's process-global ckpair registration through a
+// picked worker so it serialises with any other VLS calls that worker owns.
+// The returned index is opaque to workers and safe to hand to any of them
+// on subsequent TLS session creation.
+func (d *mode2Dispatcher) addCertKeyPair(cert, key []byte) (uint32, error) {
+	w := d.pickWorker()
+	value, err := d.submit(w, func(_ *worker) (any, error) {
+		return rawAddCertKeyPair(cert, key)
+	})
+	if err != nil {
+		return 0, err
+	}
+	return value.(uint32), nil
+}
+
+func (d *mode2Dispatcher) delCertKeyPair(idx uint32) error {
+	w := d.pickWorker()
+	_, err := d.submit(w, func(_ *worker) (any, error) {
+		return nil, rawDelCertKeyPair(idx)
+	})
+	return err
+}
+
+func (d *mode2Dispatcher) listenTLS4(ip [4]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	return d.create(func() (VLSH, error) { return rawListenTLS4(ip, port, backlog, ckp) })
+}
+
+func (d *mode2Dispatcher) listenTLS6(ip [16]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	return d.create(func() (VLSH, error) { return rawListenTLS6(ip, port, backlog, ckp) })
+}
+
+func (d *mode2Dispatcher) connectTLS4Start(ip [4]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	return d.createConnect(func() (VLSH, bool, error) {
+		return rawConnectTLS4Start(ip, port, ckp, ckpValid)
+	})
+}
+
+func (d *mode2Dispatcher) connectTLS6Start(ip [16]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	return d.createConnect(func() (VLSH, bool, error) {
+		return rawConnectTLS6Start(ip, port, ckp, ckpValid)
+	})
+}
+
 func (d *mode2Dispatcher) dialTCP4(ip [4]byte, port uint16) (VLSH, error) {
 	handle, immediate, err := d.connectTCP4Start(ip, port)
 	return d.finishLegacyConnect(handle, immediate, err, 30*time.Second)
@@ -370,6 +413,13 @@ func (d *mode2Dispatcher) writeContext(handle VLSH, p []byte, done <-chan struct
 			return 0, d.waitInterruptedError(handle, done)
 		}
 	}
+}
+
+func (d *mode2Dispatcher) shutdown(handle VLSH, how int) error {
+	_, err := d.sessionCall(handle, func(_ *worker, raw VLSH) (any, error) {
+		return nil, rawShutdown(raw, how)
+	})
+	return err
 }
 
 func (d *mode2Dispatcher) close(handle VLSH) error {

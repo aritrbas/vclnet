@@ -192,6 +192,10 @@ support solely from interface compatibility.
 
 ## 6. TLS
 
+vclnet supports two TLS paths.
+
+### 6.1 Layered `crypto/tls` (default choice)
+
 Standard Go TLS can wrap a vclnet TCP connection:
 
 ```go
@@ -210,8 +214,50 @@ if err := tlsConn.Handshake(); err != nil {
 defer tlsConn.Close()
 ```
 
-This layered `crypto/tls` path is integration-tested. Native VCL TLS
-(`VPPCOM_PROTO_TLS`) is not exposed.
+This path retains the full Go TLS surface (SNI matching, verify callbacks,
+ALPN, session tickets, `KeyLogWriter`) and is integration-tested.
+
+### 6.2 Native VCL TLS
+
+VPP's session layer can terminate TLS itself using its OpenSSL engine
+(`VPPCOM_PROTO_TLS`). vclnet exposes this via `DialTLS` and `ListenTLS`:
+
+```go
+cfg := &vclnet.TLSConfig{
+    Cert: certPEM, // PEM (leaf + optional chain)
+    Key:  keyPEM,  // PEM matching key
+}
+
+listener, err := vclnet.ListenTLS("tcp4", "10.0.0.1:443", cfg)
+if err != nil {
+    log.Fatal(err)
+}
+defer listener.Close()
+
+conn, err := vclnet.DialTLS("tcp4", "10.0.0.1:443", &vclnet.TLSConfig{})
+if err != nil {
+    log.Fatal(err)
+}
+defer conn.Close()
+```
+
+The returned values are `net.Listener` and `net.Conn`; reads and writes hand
+plaintext bytes to and from the application. TLS records are produced and
+consumed entirely inside VPP.
+
+Requirements and current caveats:
+
+* `vcl.conf` must select an in-tree TLS engine (`tls-engine 1` picks
+  OpenSSL). The engine and its version are outside vclnet's control.
+* Server configs must supply both `Cert` and `Key`. Client configs may leave
+  them empty to use VPP's anonymous ckpair (`ckpair_index = 0`).
+* Cert/key PEM bytes are registered once per unique pair (SHA-256 keyed
+  `sync.Once` cache) via `vppcom_add_cert_key_pair`.
+* The current mapping only sets `VPPCOM_ATTR_SET_CKPAIR`. SNI matching,
+  ALPN, verify hooks, session ticket lifetimes, and TLS key logging are not
+  yet exposed and remain reasons to prefer the layered path when those
+  features are needed. See
+  [../docs/vclnet_deep_dive.md §12.5](vclnet_deep_dive.md#125-native-vcl-tls-vppcom_proto_tls).
 
 ## 7. UDP
 
@@ -365,7 +411,11 @@ Before rollout:
    count.
 4. Add application-specific protocol, load, timeout, and shutdown tests.
 5. Confirm the workload does not require unconnected UDP, Mode 2 UDP, fd
-   extraction, half-close, native VCL TLS, HTTP/2, or untested gRPC behavior.
+   extraction, extended native TLS controls (SNI, ALPN, verify hooks),
+   HTTP/2, or untested gRPC behavior. Basic native VCL TLS
+   (`DialTLS` / `ListenTLS`), layered `crypto/tls`, and TCP half-close
+   (`CloseRead` / `CloseWrite`) are supported and follow `net.TCPConn`
+   semantics.
 6. Measure performance on the real topology; do not reuse illustrative latency
    numbers from unrelated VPP deployments.
 7. Pin and document the VPP/Go/library versions used for release.

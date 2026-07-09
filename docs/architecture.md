@@ -108,14 +108,18 @@ Implemented and integrated:
 - resettable read/write deadlines that affect blocked operations;
 - context-aware accept;
 - HTTP/1.1 and layered `crypto/tls`;
-- shutdown that wakes dispatcher-backed operations and rejects new work.
+- native VCL TLS (`DialTLS` / `ListenTLS`) via `VPPCOM_PROTO_TLS` with
+  `vppcom_add_cert_key_pair` + `SET_CKPAIR`, sharing the same
+  `net.Conn`/`net.Listener` surface as the plain TCP path;
+- shutdown that wakes dispatcher-backed operations and rejects new work;
+- TCP half-close (`CloseRead` / `CloseWrite`) via `vls_shutdown`.
 
 Provisional or absent:
 
 - arbitrary-peer unconnected UDP;
 - Mode 2 UDP, which returns an error wrapping `EOPNOTSUPP`;
-- TCP half-close;
-- native VCL TLS;
+- extended native TLS controls (SNI, ALPN, verify hooks via
+  `SET_ENDPT_EXT_CFG`);
 - fd extraction;
 - HTTP/2 and gRPC validation.
 

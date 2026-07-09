@@ -10,7 +10,7 @@ descriptor.
 
 The current repository demonstrates a viable architecture for TCP in both VLS
 modes and connected UDP in the default Mode 3 path. Its isolated VPP test
-harness covers IPv4, IPv6, HTTP/1.1, layered TLS,
+harness covers IPv4, IPv6, HTTP/1.1, layered TLS, native VCL TLS,
 context cancellation, live deadlines, concurrent reads/writes, shutdown, and
 VPP configured with multiple worker threads.
 
@@ -86,9 +86,10 @@ thread.
 
 ## 3. Current evidence
 
-The no-VPP suite has 141 top-level tests. The VPP-backed suites contain:
+The no-VPP suite has 160 top-level tests. The VPP-backed suites contain:
 
-- 26 runnable public-package single-worker tests;
+- 33 runnable public-package single-worker tests (including four native
+  VCL TLS integration tests);
 - 2 low-level VCL poll tests;
 - 5 multi-worker stress tests plus 2 Mode 2 ownership and UDP-rejection
   invariant tests;
@@ -97,14 +98,19 @@ The no-VPP suite has 141 top-level tests. The VPP-backed suites contain:
 
 Covered behavior includes:
 
-- TCP IPv4/IPv6 connect, listen, accept, read, write, close;
+- TCP IPv4/IPv6 connect, listen, accept, read, write, close, and half-close
+  (`CloseRead` → local `io.EOF`; `CloseWrite` → peer FIN and local
+  `net.ErrClosed`);
 - connected UDP IPv4/IPv6 in Mode 3;
 - HTTP/1.1 requests, responses, keep-alive-configured requests, and the public client helper;
 - standard `crypto/tls` over a VCL-backed connection;
+- native VCL TLS (`DialTLS`/`ListenTLS`) via VPP's OpenSSL engine with
+  functional parity against layered `crypto/tls`;
 - Happy Eyeballs on localhost;
 - connect/accept context cancellation;
 - deadlines that expire, clear, and change while a read is blocked;
 - close waking a blocked read;
+- `CloseWrite` waking a writer parked on a full VCL FIFO;
 - simultaneous blocked read/write on a 6 MiB payload;
 - multiple VPP worker threads with concurrent connection and HTTP stress;
 - shutdown before Init and shutdown waking a blocked accept.
@@ -122,8 +128,8 @@ The repository does not currently establish:
 - sharded Mode 2 listeners and accept fan-in;
 - clean-host packaging across supported distributions and VPP installs;
 - HTTP/2 or current gRPC interoperability;
-- native VCL TLS;
-- TCP half-close;
+- extended native TLS controls (SNI matching, ALPN, verify hooks, session
+  ticket policy, keylog) via `SET_ENDPT_EXT_CFG`;
 - a version range across VPP releases;
 - production soak behavior during concurrent lifecycle transitions;
 - a reproducible performance advantage over kernel networking.

@@ -143,6 +143,183 @@ static int vclpoll_close(int vlsh) {
     return vls_close((vls_handle_t)vlsh);
 }
 
+// vls_shutdown wrapper. how is a POSIX shutdown constant:
+//   SHUT_RD  (0): stop reading  (VCL_SESSION_F_RD_SHUTDOWN — reads return 0/EOF once drained)
+//   SHUT_WR  (1): stop writing  (VCL_SESSION_F_WR_SHUTDOWN — writes return VPPCOM_EPIPE;
+//                                VPP sends the shutdown message to the peer)
+//   SHUT_RDWR(2): stop both
+// Listeners cannot be shutdown (returns VPPCOM_EBADFD).
+static int vclpoll_shutdown(int vlsh, int how) {
+    return vls_shutdown((vls_handle_t)vlsh, how);
+}
+
+// --- Native VCL TLS (VPPCOM_PROTO_TLS) ---
+//
+// VPP owns the TLS state machine when a session is created with
+// VPPCOM_PROTO_TLS. The application registers a cert/key pair once with
+// vppcom_add_cert_key_pair (returns a process-global index) and then binds
+// that index to each TLS session via vppcom_session_attr(SET_CKPAIR) before
+// bind/listen or connect.
+//
+// The engine (OpenSSL / picotls) is chosen by the vpp-side plugin set and the
+// `tls-engine <N>` token in vcl.conf; vclnet does not currently expose engine
+// selection here.
+
+// Register a cert/key pair with VPP. cert and key are raw byte buffers
+// (typically PEM). On success *out_index receives the ckpair index and the
+// function returns 0. On failure it returns a negative vppcom errno.
+static int vclpoll_add_cert_key_pair(const uint8_t *cert, uint32_t cert_len,
+                                     const uint8_t *key, uint32_t key_len,
+                                     uint32_t *out_index) {
+    vppcom_cert_key_pair_t ckpair;
+    memset(&ckpair, 0, sizeof ckpair);
+    ckpair.cert     = (char *)cert;
+    ckpair.key      = (char *)key;
+    ckpair.cert_len = cert_len;
+    ckpair.key_len  = key_len;
+    int rv = vppcom_add_cert_key_pair(&ckpair);
+    if (rv < 0) {
+        return rv;
+    }
+    if (out_index) *out_index = (uint32_t)rv;
+    return 0;
+}
+
+// Release a previously registered cert/key pair.
+static int vclpoll_del_cert_key_pair(uint32_t ckp_index) {
+    return vppcom_del_cert_key_pair(ckp_index);
+}
+
+// Attach a previously registered ckpair to a session. Only valid for
+// VPPCOM_PROTO_TLS / QUIC / DTLS sessions; vppcom returns VPPCOM_EINVAL
+// otherwise.
+static int vclpoll_set_ckpair(int vlsh, uint32_t ckp_index) {
+    uint32_t buflen = sizeof(ckp_index);
+    return vls_attr((vls_handle_t)vlsh, VPPCOM_ATTR_SET_CKPAIR,
+                    &ckp_index, &buflen);
+}
+
+// Create a non-blocking TLS listener bound to IPv4 addr:port with the given
+// cert/key index. The full sequence is
+//   vls_create(PROTO_TLS)  ->  vls_attr(SET_CKPAIR)  ->  vls_bind  ->  vls_listen
+// and any failure closes the vlsh before returning the errno. This matches
+// vperf's server-side TLS setup.
+static int vclpoll_listen_tls4_nb(uint32_t ip4_be, uint16_t port_be,
+                                  int backlog, uint32_t ckp_index) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) return (int)vlsh;
+
+    uint32_t ckp_len = sizeof(ckp_index);
+    int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, backlog);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Create a non-blocking TLS listener bound to an IPv6 address + port.
+static int vclpoll_listen_tls6_nb(const uint8_t ip6[16], uint16_t port_be,
+                                  int backlog, uint32_t ckp_index) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) return (int)vlsh;
+
+    uint32_t ckp_len = sizeof(ckp_index);
+    int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    rv = vls_bind(vlsh, &ep);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    rv = vls_listen(vlsh, backlog);
+    if (rv < 0) { vls_close(vlsh); return rv; }
+
+    return (int)vlsh;
+}
+
+// Start a non-blocking TLS connect to an IPv4 endpoint. If ckp_index_valid is
+// nonzero, the caller-supplied ckpair is attached before connect (needed for
+// mTLS or when the server enforces a client cert). When ckp_index_valid is
+// zero the client relies on VPP's default (ckpair index 0), matching
+// anonymous TLS clients.
+// Returns:
+//   >=0  immediate connect (rare on TLS since the handshake needs RTTs),
+//   -EINPROGRESS  handshake pending; caller must wait for EPOLLOUT,
+//   <0   hard failure.
+// On any negative return, *out_vlsh is set (if valid) so the caller can close.
+static int vclpoll_connect_tls4_start(uint32_t ip4_be, uint16_t port_be,
+                                      uint32_t ckp_index, int ckp_index_valid,
+                                      int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    if (ckp_index_valid) {
+        uint32_t ckp_len = sizeof(ckp_index);
+        int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+        if (rv < 0) return rv;
+    }
+
+    uint8_t ip[4];
+    memcpy(ip, &ip4_be, 4);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP4;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
+// Start a non-blocking TLS connect to an IPv6 endpoint. See tls4_start.
+static int vclpoll_connect_tls6_start(const uint8_t ip6[16], uint16_t port_be,
+                                      uint32_t ckp_index, int ckp_index_valid,
+                                      int *out_vlsh) {
+    vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
+    if (vlsh < 0) { *out_vlsh = -1; return (int)vlsh; }
+    *out_vlsh = (int)vlsh;
+
+    if (ckp_index_valid) {
+        uint32_t ckp_len = sizeof(ckp_index);
+        int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
+        if (rv < 0) return rv;
+    }
+
+    uint8_t ip[16];
+    memcpy(ip, ip6, 16);
+
+    vppcom_endpt_t ep;
+    memset(&ep, 0, sizeof ep);
+    ep.is_ip4 = VPPCOM_IS_IP6;
+    ep.ip     = ip;
+    ep.port   = port_be;
+
+    return vls_connect(vlsh, &ep);
+}
+
 // Wait for a session to become readable / writable using a one-shot
 // vls_epoll_create + ctl + wait + close. timeout_s: seconds (negative = infinite).
 // events: bitmask of EPOLLIN/EPOLLOUT etc.
@@ -836,6 +1013,16 @@ func mode3Close(vlsh VLSH) error {
 	return nil
 }
 
+// mode3Shutdown issues vls_shutdown for the calling app thread. It pins the
+// current goroutine so the CGo call runs against a registered VCL worker.
+// Unlike Close, we do NOT unregister the vlsh from the shared poller — the
+// session is still alive; the peer or subsequent Close is expected to reap
+// the underlying poller state. Callers must wake any parked reader/writer.
+func mode3Shutdown(vlsh VLSH, how int) error {
+	defer pin()()
+	return rawShutdown(vlsh, how)
+}
+
 func isAgain(rv int) bool {
 	return rv == -int(syscall.EAGAIN) || rv == -int(syscall.EWOULDBLOCK)
 }
@@ -1009,6 +1196,151 @@ func rawClose(vlsh VLSH) error {
 		return vppErr("close", int(rv))
 	}
 	return nil
+}
+
+// rawShutdown issues vls_shutdown for the caller on its current, pinned OS
+// thread. The mode-2 worker uses this from inside its loop; the mode-3 path
+// wraps it with pin().
+func rawShutdown(vlsh VLSH, how int) error {
+	if rv := C.vclpoll_shutdown(C.int(vlsh), C.int(how)); rv < 0 {
+		return vppErr("shutdown", int(rv))
+	}
+	return nil
+}
+
+// rawAddCertKeyPair registers a PEM cert+key pair with VPP and returns the
+// process-global ckpair index. The CGo call runs on the calling OS thread;
+// callers in mode-3 must have pinned themselves already, and mode-2 must
+// submit this to a worker so registration serialises with other VLS calls
+// against the shared registry.
+func rawAddCertKeyPair(cert, key []byte) (uint32, error) {
+	if len(cert) == 0 || len(key) == 0 {
+		return 0, syscall.EINVAL
+	}
+	var idx C.uint32_t
+	rv := C.vclpoll_add_cert_key_pair(
+		(*C.uint8_t)(unsafe.Pointer(&cert[0])), C.uint32_t(len(cert)),
+		(*C.uint8_t)(unsafe.Pointer(&key[0])), C.uint32_t(len(key)),
+		&idx)
+	if rv < 0 {
+		return 0, vppErr("add_cert_key_pair", int(rv))
+	}
+	return uint32(idx), nil
+}
+
+// rawDelCertKeyPair releases a previously registered ckpair. Safe to call
+// even if VPP has already torn down the entry (returns EINVAL, which we
+// forward — teardown paths typically ignore the error).
+func rawDelCertKeyPair(idx uint32) error {
+	rv := C.vclpoll_del_cert_key_pair(C.uint32_t(idx))
+	if rv < 0 {
+		return vppErr("del_cert_key_pair", int(rv))
+	}
+	return nil
+}
+
+// rawListenTLS4 creates a non-blocking TLS listener bound to ip4:port with
+// the given ckpair attached.
+func rawListenTLS4(ip4 [4]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	rv := C.vclpoll_listen_tls4_nb(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)),
+		C.int(backlog), C.uint32_t(ckp))
+	if rv < 0 {
+		return invalidVLSH, vppErr("listen_tls4", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+// rawListenTLS6 creates a non-blocking TLS listener bound to ip6:port with
+// the given ckpair attached.
+func rawListenTLS6(ip6 [16]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	rv := C.vclpoll_listen_tls6_nb((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)),
+		C.int(backlog), C.uint32_t(ckp))
+	if rv < 0 {
+		return invalidVLSH, vppErr("listen_tls6", int(rv))
+	}
+	return VLSH(rv), nil
+}
+
+// rawConnectTLS4Start initiates a non-blocking TLS4 connect. When ckpValid
+// is true the ckpair is attached before connect (mTLS scenarios); when
+// false the client relies on VPP's default.
+// Returns (vlsh, true, nil) on immediate handshake completion (rare),
+// (vlsh, false, nil) on EINPROGRESS (typical),
+// (invalidVLSH, false, err) on hard failure.
+func rawConnectTLS4Start(ip4 [4]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	var outVLSH C.int = -1
+	valid := C.int(0)
+	if ckpValid {
+		valid = 1
+	}
+	rv := C.vclpoll_connect_tls4_start(C.uint32_t(ipBE(ip4)), C.uint16_t(portBE(port)),
+		C.uint32_t(ckp), valid, &outVLSH)
+	vlsh := VLSH(outVLSH)
+	if rv >= 0 {
+		return vlsh, true, nil
+	}
+	if isInProgress(int(rv)) || isAgain(int(rv)) {
+		return vlsh, false, nil
+	}
+	if vlsh >= 0 {
+		C.vclpoll_close(C.int(vlsh))
+	}
+	return invalidVLSH, false, vppErr("connect_tls4_start", int(rv))
+}
+
+// rawConnectTLS6Start initiates a non-blocking TLS6 connect. See TLS4 variant.
+func rawConnectTLS6Start(ip6 [16]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	var outVLSH C.int = -1
+	valid := C.int(0)
+	if ckpValid {
+		valid = 1
+	}
+	rv := C.vclpoll_connect_tls6_start((*C.uint8_t)(&ip6[0]), C.uint16_t(portBE(port)),
+		C.uint32_t(ckp), valid, &outVLSH)
+	vlsh := VLSH(outVLSH)
+	if rv >= 0 {
+		return vlsh, true, nil
+	}
+	if isInProgress(int(rv)) || isAgain(int(rv)) {
+		return vlsh, false, nil
+	}
+	if vlsh >= 0 {
+		C.vclpoll_close(C.int(vlsh))
+	}
+	return invalidVLSH, false, vppErr("connect_tls6_start", int(rv))
+}
+
+// mode3AddCertKeyPair wraps rawAddCertKeyPair with pin() so registration
+// runs against a registered VCL worker and cannot race worker registration
+// on another thread.
+func mode3AddCertKeyPair(cert, key []byte) (uint32, error) {
+	defer pin()()
+	return rawAddCertKeyPair(cert, key)
+}
+
+func mode3DelCertKeyPair(idx uint32) error {
+	defer pin()()
+	return rawDelCertKeyPair(idx)
+}
+
+func mode3ListenTLS4(ip4 [4]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	defer pin()()
+	return rawListenTLS4(ip4, port, backlog, ckp)
+}
+
+func mode3ListenTLS6(ip6 [16]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
+	defer pin()()
+	return rawListenTLS6(ip6, port, backlog, ckp)
+}
+
+func mode3ConnectTLS4Start(ip4 [4]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	defer pin()()
+	return rawConnectTLS4Start(ip4, port, ckp, ckpValid)
+}
+
+func mode3ConnectTLS6Start(ip6 [16]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
+	defer pin()()
+	return rawConnectTLS6Start(ip6, port, ckp, ckpValid)
 }
 
 func rawSendTo(vlsh VLSH, p []byte, addr AddrInfo) (int, error) {

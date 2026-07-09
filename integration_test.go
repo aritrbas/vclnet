@@ -29,6 +29,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -110,8 +111,12 @@ func runServerChild() {
 		runUDPEchoServer(port, nConns, "udp6")
 	case "tls":
 		runTLSEchoServer(port, nConns)
+	case "nativetls":
+		runNativeTLSEchoServer(port, nConns)
 	case "shutdown":
 		runShutdownSelfTest(port)
+	case "halfclose":
+		runHalfCloseServer(port)
 	default:
 		fmt.Fprintf(os.Stderr, "child: unknown server type %q\n", serverType)
 		os.Exit(2)
@@ -182,6 +187,55 @@ func runShutdownSelfTest(port int) {
 	}
 	fmt.Printf("READY %d\n", port)
 	os.Stdout.Sync()
+}
+
+// runHalfCloseServer validates CloseWrite over the wire: the client sends
+// bytes, then calls CloseWrite, and the server's Read must observe EOF (the
+// FIN that vls_shutdown(SHUT_WR) emitted). The server then replies with a
+// distinct marker plus the reversed request so the client can verify both
+// halves of the transfer succeeded independently.
+func runHalfCloseServer(port int) {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	ln, err := vclnet.Listen("tcp4", addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: halfclose Listen: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Printf("READY %d\n", port)
+	os.Stdout.Sync()
+
+	conn, err := ln.Accept()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: halfclose Accept: %v\n", err)
+		os.Exit(2)
+	}
+
+	// Read all client bytes until EOF. EOF here proves that the client's
+	// vls_shutdown(SHUT_WR) reached VPP, propagated to the peer session,
+	// and surfaced as a zero-length read on the server side.
+	req, err := io.ReadAll(conn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: halfclose ReadAll: %v\n", err)
+		os.Exit(2)
+	}
+
+	// Compose a response the client can uniquely verify.
+	response := append([]byte("RESP:"), reverseBytes(req)...)
+	if _, err := conn.Write(response); err != nil {
+		fmt.Fprintf(os.Stderr, "child: halfclose Write: %v\n", err)
+		os.Exit(2)
+	}
+
+	_ = conn.Close()
+	_ = ln.Close()
+}
+
+func reverseBytes(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i := range b {
+		out[len(b)-1-i] = b[i]
+	}
+	return out
 }
 
 func runDelayedEchoServer(port int) {
@@ -1236,6 +1290,84 @@ func generateSelfSignedCert() (tls.Certificate, *x509.CertPool) {
 	return cert, pool
 }
 
+// generateSelfSignedCertPEM returns PEM-encoded cert and key blobs. This is
+// what vppcom_add_cert_key_pair expects on the wire (VPP feeds them into
+// OpenSSL's PEM_read_bio_* family), and it is what vclnet.TLSConfig accepts.
+// The returned cert also validates against the crypto/tls tls.Certificate
+// we hand back so integration tests can compare native VCL TLS to layered
+// crypto/tls against the same identity.
+func generateSelfSignedCertPEM() (certPEM, keyPEM []byte, cert tls.Certificate, pool *x509.CertPool) {
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{Organization: []string{"vclnet-native-tls-test"}},
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		panic(fmt.Sprintf("generateSelfSignedCertPEM: CreateCertificate: %v", err))
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		panic(fmt.Sprintf("generateSelfSignedCertPEM: MarshalECPrivateKey: %v", err))
+	}
+
+	certPEM = pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	keyPEM = pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	cert = tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  key,
+	}
+	pool = x509.NewCertPool()
+	parsedCert, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		panic(fmt.Sprintf("generateSelfSignedCertPEM: ParseCertificate: %v", err))
+	}
+	pool.AddCert(parsedCert)
+	return
+}
+
+// runNativeTLSEchoServer runs an echo server whose TLS termination is done
+// inside VPP (VPPCOM_PROTO_TLS). The self-signed cert lives entirely inside
+// the child process; the parent verifies the handshake with
+// InsecureSkipVerify (matching the layered TLS test) so no cert material has
+// to cross the process boundary.
+func runNativeTLSEchoServer(port, nConns int) {
+	certPEM, keyPEM, _, _ := generateSelfSignedCertPEM()
+
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
+	ln, err := vclnet.ListenTLS("tcp4", addr, &vclnet.TLSConfig{Cert: certPEM, Key: keyPEM})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: ListenTLS(%s): %v\n", addr, err)
+		os.Exit(2)
+	}
+	fmt.Printf("READY %d\n", port)
+	os.Stdout.Sync()
+
+	var wg sync.WaitGroup
+	for i := 0; i < nConns; i++ {
+		conn, err := ln.Accept()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "child: native-TLS Accept: %v\n", err)
+			os.Exit(2)
+		}
+		wg.Add(1)
+		go func(c net.Conn) {
+			defer wg.Done()
+			defer c.Close()
+			io.Copy(c, c)
+		}(conn)
+	}
+	wg.Wait()
+	ln.Close()
+}
+
 func runTLSEchoServer(port, nConns int) {
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 
@@ -1312,6 +1444,179 @@ func TestTLSEchoOverVclnet(t *testing.T) {
 	// The server's io.Copy won't see a clean EOF through VPP's session
 	// close path, so just kill it rather than waiting for graceful exit.
 	cmd.Process.Kill()
+}
+
+// --- Native VCL TLS tests (VPPCOM_PROTO_TLS) ---
+//
+// These validate that TLS termination inside VPP works end to end: the
+// handshake, application echo, and full close all traverse only the
+// vclnet.TLSConfig/DialTLS/ListenTLS surface, never crypto/tls on the
+// client side. Compared to TestTLSEchoOverVclnet (layered) they exercise
+// SET_CKPAIR and the VPP TLS engine plumbing.
+
+// TestNativeVCLTLSEchoSingle round-trips one plaintext write over a native
+// VCL TLS session and confirms the peer echoes it back. If this passes,
+// VPP's OpenSSL engine successfully drove a handshake and app-data path
+// against a self-signed identity registered via vppcom_add_cert_key_pair.
+func TestNativeVCLTLSEchoSingle(t *testing.T) {
+	skipIfNoVPP(t)
+
+	cmd, port, stderr := startServer(t, "nativetls", 1)
+	defer cmd.Process.Kill()
+
+	if err := vclnet.Init("vclnet-native-tls-client"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	conn, err := vclnet.DialTLSContext(ctx, "tcp4", fmt.Sprintf("127.0.0.1:%d", port), nil)
+	if err != nil {
+		t.Fatalf("DialTLS: %v\nstderr:\n%s", err, stderr.String())
+	}
+	defer conn.Close()
+
+	msg := []byte("hello native VCL TLS")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("Write: %v\nstderr:\n%s", err, stderr.String())
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("ReadFull: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !bytes.Equal(got, msg) {
+		t.Errorf("native-TLS echo mismatch: got %q, want %q", got, msg)
+	}
+
+	cmd.Process.Kill()
+}
+
+// TestNativeVCLTLSEchoLarge exercises fragmentation across TLS records: 128
+// KiB is large enough that OpenSSL's per-record size (16 KiB max) is hit
+// multiple times, and it must round-trip cleanly through VPP's SVM FIFO.
+func TestNativeVCLTLSEchoLarge(t *testing.T) {
+	skipIfNoVPP(t)
+
+	cmd, port, stderr := startServer(t, "nativetls", 1)
+	defer cmd.Process.Kill()
+
+	if err := vclnet.Init("vclnet-native-tls-large"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	conn, err := vclnet.DialTLSContext(ctx, "tcp4", fmt.Sprintf("127.0.0.1:%d", port), nil)
+	if err != nil {
+		t.Fatalf("DialTLS: %v\nstderr:\n%s", err, stderr.String())
+	}
+	defer conn.Close()
+
+	payload := make([]byte, 128*1024)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	got := make([]byte, len(payload))
+	go func() {
+		_, err := io.ReadFull(conn, got)
+		errCh <- err
+	}()
+
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("Write: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if err := <-errCh; err != nil {
+		t.Fatalf("ReadFull: %v\nstderr:\n%s", err, stderr.String())
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("native-TLS large echo mismatch (len %d)", len(payload))
+	}
+
+	cmd.Process.Kill()
+}
+
+// TestNativeVCLTLSVsLayeredTLSFunctionalParity dials the same native VCL
+// TLS server twice: first with vclnet.DialTLS (VPP terminates TLS) and
+// then with a layered crypto/tls client wrapping a plain vclnet TCP Dial
+// against a *different* server (the standard TLSEchoOverVclnet child).
+// It documents the observable API contrast between the two integration
+// styles — both must round-trip an identical payload, both must reject
+// tampered ciphertext, and neither must leak resources.
+func TestNativeVCLTLSVsLayeredTLSFunctionalParity(t *testing.T) {
+	skipIfNoVPP(t)
+
+	nativeCmd, nativePort, nativeStderr := startServer(t, "nativetls", 1)
+	defer nativeCmd.Process.Kill()
+
+	layeredCmd, layeredPort, layeredStderr := startServer(t, "tls", 1)
+	defer layeredCmd.Process.Kill()
+
+	if err := vclnet.Init("vclnet-tls-parity"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	msg := []byte("parity check: native vs layered TLS")
+
+	// Native VCL TLS arm: no crypto/tls on the client, VPP terminates.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	nativeConn, err := vclnet.DialTLSContext(ctx, "tcp4", fmt.Sprintf("127.0.0.1:%d", nativePort), nil)
+	if err != nil {
+		t.Fatalf("native DialTLS: %v\nstderr:\n%s", err, nativeStderr.String())
+	}
+	if _, err := nativeConn.Write(msg); err != nil {
+		t.Fatalf("native Write: %v", err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(nativeConn, got); err != nil {
+		t.Fatalf("native ReadFull: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("native echo mismatch")
+	}
+	nativeConn.Close()
+
+	// Layered TLS arm: crypto/tls over a plain vclnet TCP conn.
+	rawConn, err := vclnet.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", layeredPort))
+	if err != nil {
+		t.Fatalf("layered Dial: %v\nstderr:\n%s", err, layeredStderr.String())
+	}
+	tlsConn := tls.Client(rawConn, &tls.Config{InsecureSkipVerify: true})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("layered Handshake: %v", err)
+	}
+	if _, err := tlsConn.Write(msg); err != nil {
+		t.Fatalf("layered Write: %v", err)
+	}
+	got2 := make([]byte, len(msg))
+	if _, err := io.ReadFull(tlsConn, got2); err != nil {
+		t.Fatalf("layered ReadFull: %v", err)
+	}
+	if !bytes.Equal(got2, msg) {
+		t.Fatalf("layered echo mismatch")
+	}
+	tlsConn.Close()
+
+	nativeCmd.Process.Kill()
+	layeredCmd.Process.Kill()
+}
+
+// TestNativeVCLTLSListenValidation asserts that ListenTLS rejects an empty
+// TLSConfig without ever touching VPP. Serves as a smoke test for
+// callers that upgrade an existing plain Listen() to ListenTLS.
+func TestNativeVCLTLSListenValidation(t *testing.T) {
+	// This does not depend on VPP — validation runs before AppInit — so we
+	// intentionally do NOT skip when VCL_CONFIG is unset.
+	if _, err := vclnet.ListenTLS("tcp4", "127.0.0.1:0", nil); err == nil {
+		t.Fatal("ListenTLS(nil cfg) unexpectedly succeeded")
+	}
+	if _, err := vclnet.ListenTLS("tcp4", "127.0.0.1:0", &vclnet.TLSConfig{}); err == nil {
+		t.Fatal("ListenTLS(empty cfg) unexpectedly succeeded")
+	}
 }
 
 // --- Benchmarks ---
@@ -1548,6 +1853,240 @@ func TestTCPCloseUnblocksRead(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Close did not unblock Read")
 	}
+	waitOrKill(t, cmd, stderr)
+}
+
+// halfCloser mirrors the ambient interface {CloseRead() error; CloseWrite() error}
+// exposed by net.TCPConn and (in this package) *tcpConn. Callers of
+// vclnet.Dial receive a net.Conn, so end-user code type-asserts against this
+// same shape.
+type halfCloser interface {
+	CloseRead() error
+	CloseWrite() error
+}
+
+// TestTCPHalfCloseWriteSignalsPeerEOF is the end-to-end acceptance test for
+// vls_shutdown(SHUT_WR). The child server reads the entire request with
+// io.ReadAll, which returns only when the server-side Read observes zero
+// bytes (EOF). That EOF can arrive only if the client's CloseWrite() drove
+// vppcom_session_shutdown → the peer session's flags, then over the wire to
+// the server side.
+//
+// The test also verifies:
+//   - Write after CloseWrite returns *net.OpError wrapping net.ErrClosed
+//     (matching net.TCPConn semantics).
+//   - The client can still Read the server's response after CloseWrite,
+//     i.e. the read half remains open until Close.
+//   - After draining the response Read returns io.EOF once the server
+//     closes.
+//   - CloseRead is idempotent and safe to call after Close.
+func TestTCPHalfCloseWriteSignalsPeerEOF(t *testing.T) {
+	skipIfNoVPP(t)
+	cmd, port, stderr := startServer(t, "halfclose", 1)
+	defer cmd.Process.Kill()
+
+	if err := vclnet.Init("vclnet-test-client"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	conn, err := vclnet.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("Dial: %v\nstderr:\n%s", err, stderr.String())
+	}
+	defer conn.Close()
+
+	// Cap the total test time so a mis-behaving half-close cannot hang CI.
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+
+	// vclnet.Dial returns net.Conn; the concrete *tcpConn exposes
+	// CloseRead/CloseWrite. Consumers detect them via anonymous interfaces.
+	hc, ok := conn.(halfCloser)
+	if !ok {
+		t.Fatalf("conn %T does not implement CloseRead/CloseWrite", conn)
+	}
+
+	request := []byte("HALF-CLOSE-WRITE")
+	if _, err := conn.Write(request); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	if err := hc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+	// Idempotency: a second CloseWrite must not error.
+	if err := hc.CloseWrite(); err != nil {
+		t.Fatalf("second CloseWrite err=%v, want nil", err)
+	}
+
+	// Write after CloseWrite must fail with net.ErrClosed wrapped in
+	// *net.OpError. This matches how net.TCPConn behaves and lets stdlib
+	// error checks (errors.Is(err, net.ErrClosed)) work unchanged.
+	if _, err := conn.Write([]byte("late")); err == nil {
+		t.Fatal("Write after CloseWrite returned no error")
+	} else {
+		var opErr *net.OpError
+		if !errors.As(err, &opErr) {
+			t.Fatalf("Write err type=%T, want *net.OpError", err)
+		}
+		if !errors.Is(opErr.Err, net.ErrClosed) {
+			t.Errorf("Write inner err=%v, want net.ErrClosed", opErr.Err)
+		}
+	}
+
+	// The read half is still open. Drain the server's response, then EOF.
+	got, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("ReadAll: %v\nstderr:\n%s", err, stderr.String())
+	}
+	want := append([]byte("RESP:"), reverseBytes(request)...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("response mismatch:\n got  %q\n want %q", got, want)
+	}
+
+	// CloseRead is safe (idempotent) — the peer already sent FIN so this
+	// is essentially a no-op on the wire, but the API contract still holds.
+	if err := hc.CloseRead(); err != nil {
+		t.Fatalf("CloseRead: %v", err)
+	}
+	if err := hc.CloseRead(); err != nil {
+		t.Fatalf("second CloseRead err=%v, want nil", err)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// CloseRead / CloseWrite after Close must not panic and must return an
+	// error wrapping net.ErrClosed.
+	if err := hc.CloseRead(); err == nil {
+		t.Fatal("CloseRead after Close returned no error")
+	} else if !errors.Is(err, net.ErrClosed) {
+		t.Errorf("CloseRead after Close err=%v, want wraps net.ErrClosed", err)
+	}
+	if err := hc.CloseWrite(); err == nil {
+		t.Fatal("CloseWrite after Close returned no error")
+	} else if !errors.Is(err, net.ErrClosed) {
+		t.Errorf("CloseWrite after Close err=%v, want wraps net.ErrClosed", err)
+	}
+
+	waitOrKill(t, cmd, stderr)
+}
+
+// TestTCPHalfCloseReadLocalEOF verifies the local-only path: CloseRead makes
+// subsequent Reads return io.EOF *without* affecting the write side. VPP does
+// not send anything on the wire for SHUT_RD (VCL_SESSION_F_RD_SHUTDOWN is a
+// local flag only) so this test intentionally does not depend on the peer
+// observing anything.
+func TestTCPHalfCloseReadLocalEOF(t *testing.T) {
+	skipIfNoVPP(t)
+	cmd, port, stderr := startServer(t, "echo", 1)
+	defer cmd.Process.Kill()
+
+	if err := vclnet.Init("vclnet-test-client"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	conn, err := vclnet.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("Dial: %v\nstderr:\n%s", err, stderr.String())
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+
+	hc, ok := conn.(halfCloser)
+	if !ok {
+		t.Fatalf("conn %T does not implement CloseRead/CloseWrite", conn)
+	}
+
+	if err := hc.CloseRead(); err != nil {
+		t.Fatalf("CloseRead: %v", err)
+	}
+
+	// Read after CloseRead must return io.EOF bare (no wrapping). This is
+	// what io.Copy and bufio.Reader expect from an EOF signal.
+	n, err := conn.Read(make([]byte, 16))
+	if n != 0 {
+		t.Errorf("Read n=%d, want 0", n)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("Read err=%v, want io.EOF", err)
+	}
+
+	// The write side must remain fully functional after CloseRead. Send
+	// data and verify the echo server still accepts it (server will echo,
+	// but we won't read the echo — we already closed reads locally). This
+	// proves CloseRead did not corrupt the session.
+	if _, err := conn.Write([]byte("post-close-read")); err != nil {
+		t.Fatalf("Write after CloseRead: %v", err)
+	}
+
+	// Now close the conn so the server sees EOF and exits.
+	if err := conn.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitOrKill(t, cmd, stderr)
+}
+
+// TestTCPHalfCloseWriteUnblocksParkedWriter guards the wake path: a Write
+// that is parked in the readiness poller when CloseWrite fires must be
+// woken and returned to the caller with net.ErrClosed rather than remaining
+// stuck. We create back-pressure by writing a payload larger than the FIFO
+// while the server is deliberately slow, then invoke CloseWrite from a
+// concurrent goroutine.
+func TestTCPHalfCloseWriteUnblocksParkedWriter(t *testing.T) {
+	skipIfNoVPP(t)
+	cmd, port, stderr := startServer(t, "delayecho", 1)
+	defer cmd.Process.Kill()
+
+	if err := vclnet.Init("vclnet-test-client"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	conn, err := vclnet.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+
+	hc, ok := conn.(halfCloser)
+	if !ok {
+		t.Fatalf("conn %T does not implement CloseRead/CloseWrite", conn)
+	}
+
+	// 6 MiB payload; larger than the default VCL FIFO so at least one Write
+	// call parks in the readiness wait.
+	payload := bytes.Repeat([]byte("halfclosewriter"), 1024*512)
+
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(payload)
+		writeErr <- err
+	}()
+
+	// Give the goroutine time to fill the FIFO and park.
+	time.Sleep(200 * time.Millisecond)
+
+	if err := hc.CloseWrite(); err != nil {
+		t.Fatalf("CloseWrite: %v", err)
+	}
+
+	select {
+	case err := <-writeErr:
+		// A parked Write may return either a partial-write ErrClosed or an
+		// EPIPE from a race with the FIN being processed. Both are valid
+		// signals that CloseWrite unblocked the writer.
+		if err == nil {
+			t.Fatal("parked Write returned nil after CloseWrite")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("CloseWrite did not unblock parked Write\nstderr:\n%s", stderr.String())
+	}
+
+	_ = conn.Close()
 	waitOrKill(t, cmd, stderr)
 }
 

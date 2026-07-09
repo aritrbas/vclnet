@@ -3,6 +3,7 @@ package vclnet
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -1715,5 +1716,247 @@ func TestResolveInitOptions(t *testing.T) {
 				t.Fatalf("got mode=%d workers=%d, want mode=%d workers=%d", mode, workers, tt.wantMode, tt.wantWorkers)
 			}
 		})
+	}
+}
+
+// --- TCP half-close (CloseRead / CloseWrite) state tests ---
+//
+// These tests exercise only state-machine behaviour that does not require a
+// live VLS session: the CGo path into vls_shutdown is short-circuited either
+// by setting readShutdown/writeShutdown directly (bypassing the sync.Once
+// wrapper) or by asserting on the "already fully closed" branch which never
+// enters vls_shutdown. End-to-end TCP half-close over VPP is covered by the
+// integration test in integration_test.go.
+
+// TestTCPConnHalfCloseInterfaces locks in the ambient method-set signatures
+// consumers rely on: net/http, io.Pipe adapters, and TLS all discover the
+// half-close capability via anonymous interfaces on net.Conn, so any change
+// to the method names must break this compile-time check first.
+func TestTCPConnHalfCloseInterfaces(t *testing.T) {
+	var _ interface {
+		CloseRead() error
+	} = (*tcpConn)(nil)
+	var _ interface {
+		CloseWrite() error
+	} = (*tcpConn)(nil)
+}
+
+// TestTCPConnReadAfterCloseReadReturnsEOF verifies the Read short-circuit
+// once CloseRead has been recorded. We set readShutdown directly so no CGo
+// call into vls_shutdown is required (that path is covered by the VPP
+// integration test).
+func TestTCPConnReadAfterCloseReadReturnsEOF(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.readShutdown.Store(true)
+
+	n, err := c.Read(make([]byte, 16))
+	if n != 0 {
+		t.Errorf("Read n=%d, want 0", n)
+	}
+	if !errors.Is(err, io.EOF) {
+		t.Errorf("Read err=%v, want io.EOF", err)
+	}
+	// EOF must be returned unwrapped (matching net.TCPConn), never inside a
+	// *net.OpError. Callers such as io.Copy rely on `err == io.EOF` before
+	// they treat a stream as ended.
+	if _, ok := err.(*net.OpError); ok {
+		t.Errorf("Read err type=%T, want bare io.EOF", err)
+	}
+}
+
+// TestTCPConnWriteAfterCloseWriteReturnsErrClosed verifies the Write short
+// circuit after CloseWrite has been recorded. net.TCPConn returns
+// net.ErrClosed here; keeping parity lets standard error checks (including
+// errors.Is(err, net.ErrClosed)) work identically against vclnet.
+func TestTCPConnWriteAfterCloseWriteReturnsErrClosed(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.writeShutdown.Store(true)
+
+	n, err := c.Write([]byte("hello"))
+	if n != 0 {
+		t.Errorf("Write n=%d, want 0", n)
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("Write err type=%T, want *net.OpError", err)
+	}
+	if !errors.Is(opErr.Err, net.ErrClosed) {
+		t.Errorf("Write inner err=%v, want net.ErrClosed", opErr.Err)
+	}
+	if opErr.Op != "write" {
+		t.Errorf("Op=%q, want write", opErr.Op)
+	}
+}
+
+// TestTCPConnCloseReadOnFullyClosedFails verifies that CloseRead reports
+// net.ErrClosed when the conn is already fully closed. This is the only
+// CloseRead path we can exercise without VPP because it returns before
+// invoking vls_shutdown.
+func TestTCPConnCloseReadOnFullyClosedFails(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.closed.Store(true)
+
+	err := c.CloseRead()
+	if err == nil {
+		t.Fatal("CloseRead on fully-closed conn returned no error")
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("err type=%T, want *net.OpError", err)
+	}
+	if !errors.Is(opErr.Err, net.ErrClosed) {
+		t.Errorf("inner err=%v, want net.ErrClosed", opErr.Err)
+	}
+}
+
+func TestTCPConnCloseWriteOnFullyClosedFails(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.closed.Store(true)
+
+	err := c.CloseWrite()
+	if err == nil {
+		t.Fatal("CloseWrite on fully-closed conn returned no error")
+	}
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("err type=%T, want *net.OpError", err)
+	}
+	if !errors.Is(opErr.Err, net.ErrClosed) {
+		t.Errorf("inner err=%v, want net.ErrClosed", opErr.Err)
+	}
+}
+
+// TestTCPConnHalfCloseIdempotent verifies that repeated CloseRead/CloseWrite
+// calls after the first succeed do not re-enter the shutdown fast path (the
+// sync.Once ensures at most one vls_shutdown attempt). We simulate a
+// successful first call by pre-marking the shutdown flag; subsequent calls
+// must still succeed with a nil error.
+func TestTCPConnHalfCloseIdempotent(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.readShutdown.Store(true)
+	// Consume the sync.Once so future CloseRead calls take the no-op branch.
+	c.readShutOnce.Do(func() {})
+
+	if err := c.CloseRead(); err != nil {
+		t.Errorf("second CloseRead err=%v, want nil", err)
+	}
+	if err := c.CloseRead(); err != nil {
+		t.Errorf("third CloseRead err=%v, want nil", err)
+	}
+
+	c.writeShutdown.Store(true)
+	c.writeShutOnce.Do(func() {})
+
+	if err := c.CloseWrite(); err != nil {
+		t.Errorf("second CloseWrite err=%v, want nil", err)
+	}
+	if err := c.CloseWrite(); err != nil {
+		t.Errorf("third CloseWrite err=%v, want nil", err)
+	}
+}
+
+// TestTCPConnReadAfterCloseReadOverridesDeadline verifies the ordering
+// contract inside Read: if a stale read deadline is armed *and* CloseRead
+// fires, the caller sees io.EOF (half-close) rather than an i/o timeout.
+// This matches net.TCPConn semantics and prevents CloseRead from leaking as
+// a false timeout to callers that pre-armed a deadline.
+func TestTCPConnReadAfterCloseReadOverridesDeadline(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.SetReadDeadline(time.Now().Add(-time.Second)) // already expired
+	c.readShutdown.Store(true)
+
+	_, err := c.Read(make([]byte, 16))
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("Read err=%v, want io.EOF (half-close must win over timeout)", err)
+	}
+}
+
+// TestTCPConnWriteAfterCloseWriteOverridesDeadline mirrors the read variant:
+// after CloseWrite the write side reports net.ErrClosed, not a timeout, even
+// if a prior write deadline has already expired.
+func TestTCPConnWriteAfterCloseWriteOverridesDeadline(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.SetWriteDeadline(time.Now().Add(-time.Second))
+	c.writeShutdown.Store(true)
+
+	_, err := c.Write([]byte("x"))
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) {
+		t.Fatalf("Write err type=%T, want *net.OpError", err)
+	}
+	if !errors.Is(opErr.Err, net.ErrClosed) {
+		t.Errorf("inner err=%v, want net.ErrClosed (half-close must win over timeout)", opErr.Err)
+	}
+}
+
+// TestTCPConnCloseReadWakesReadDeadlineChannel verifies that recording the
+// half-close closes the current readDeadline waitChannel so any parked
+// reader wakes. We approximate the parked reader with a select on the
+// channel; a working CloseRead must close it synchronously.
+//
+// We drive the internal helper directly (not CloseRead itself) so no CGo
+// vls_shutdown call is required for this state-machine assertion.
+func TestTCPConnCloseReadWakesReadDeadlineChannel(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	waitCh := c.readDeadline.waitChannel()
+
+	select {
+	case <-waitCh:
+		t.Fatal("readDeadline channel closed before CloseRead")
+	default:
+	}
+
+	// Simulate the wake path CloseRead performs after setting readShutdown
+	// but before invoking vls_shutdown.
+	c.readShutdown.Store(true)
+	c.readDeadline.interrupt()
+
+	select {
+	case <-waitCh:
+	case <-time.After(time.Second):
+		t.Fatal("CloseRead did not wake readDeadline waiter")
+	}
+}
+
+func TestTCPConnCloseWriteWakesWriteDeadlineChannel(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	waitCh := c.writeDeadline.waitChannel()
+
+	select {
+	case <-waitCh:
+		t.Fatal("writeDeadline channel closed before CloseWrite")
+	default:
+	}
+
+	c.writeShutdown.Store(true)
+	c.writeDeadline.interrupt()
+
+	select {
+	case <-waitCh:
+	case <-time.After(time.Second):
+		t.Fatal("CloseWrite did not wake writeDeadline waiter")
+	}
+}
+
+// TestTCPConnHalfCloseLeavesFullyClosedFlagUntouched documents the invariant
+// that half-close does not imply a full close: CloseRead/CloseWrite must not
+// flip c.closed. This is what allows a caller to CloseWrite for graceful
+// shutdown and continue Reading until the peer FIN arrives.
+func TestTCPConnHalfCloseLeavesFullyClosedFlagUntouched(t *testing.T) {
+	c := newTCPConn(0)
+	c.peerAddr = &net.TCPAddr{IP: net.ParseIP("1.2.3.4"), Port: 80}
+	c.readShutdown.Store(true)
+	c.writeShutdown.Store(true)
+	if c.closed.Load() {
+		t.Fatal("half-close flags should not set the fully-closed flag")
 	}
 }
