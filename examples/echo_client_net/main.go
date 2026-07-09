@@ -12,7 +12,7 @@ import (
 	"log"
 	"os"
 
-	"vclnet"
+	"github.com/aritrbas/vclnet"
 )
 
 func main() {

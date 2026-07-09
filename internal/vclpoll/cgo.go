@@ -13,8 +13,16 @@
 package vclpoll
 
 /*
-#cgo CFLAGS: -I/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/include
-#cgo LDFLAGS: -L/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/lib/x86_64-linux-gnu -lvppcom -Wl,-rpath,/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/lib/x86_64-linux-gnu
+// VPP discovery is driven entirely by pkg-config. The repository ships
+// pkgconfig/vppcom.pc.in; run
+//
+//	make pc VPP_PREFIX=/path/to/vpp
+//
+// to render pkgconfig/vppcom.pc for a specific VPP install, then build with
+// PKG_CONFIG_PATH pointed at that directory (the Makefile does this for you).
+// Alternatively, install a vppcom.pc file into the system pkg-config search
+// path (or set PKG_CONFIG_PATH yourself).
+#cgo pkg-config: vppcom
 
 #include <stdint.h>
 #include <stdlib.h>

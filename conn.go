@@ -8,7 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 // deadlineState provides resettable deadline notification. Every Set call

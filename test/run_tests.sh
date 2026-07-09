@@ -11,19 +11,27 @@
 #   - VPP running with `session { enable use-app-socket-api }`.
 #   - /run/vpp/app_ns_sockets/default world-writable.
 #   - Go ≥ 1.26.
+#
+# VPP paths are resolved by test/env.sh. Override VPP_PREFIX (or the individual
+# VPP_BIN / VPPCTL / VPP_LIB variables) on the environment for non-default
+# installs.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Default to the release build (matches cgo linker rpath in
-# internal/vclpoll/cgo.go). Override VPP_LIB to point at a debug build.
-VPP_LIB="${VPP_LIB:-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/lib/x86_64-linux-gnu}"
+# shellcheck source=env.sh
+source "$SCRIPT_DIR/env.sh"
+
 VPP_APP_SOCKET="${VPP_APP_SOCKET:-/run/vpp/app_ns_sockets/default}"
 
 SHARE_DIR="${SHARE_DIR:-/tmp/vclnet-share}"
 VCL_CONF="$SHARE_DIR/vcl.conf"
+
+if [ -f "$REPO_DIR/pkgconfig/vppcom.pc" ]; then
+    export PKG_CONFIG_PATH="$REPO_DIR/pkgconfig:${PKG_CONFIG_PATH:-}"
+fi
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; CYAN='\033[0;36m'; NC='\033[0m'
 pass() { echo -e "${GREEN}[PASS]${NC} $*"; }
@@ -62,14 +70,14 @@ run_go_tests() {
     cd "$REPO_DIR"
     LD_LIBRARY_PATH="$VPP_LIB" \
     VCL_CONFIG="$VCL_CONF" \
-        go test -v -count=1 -timeout 120s ./...
+        "$GO_BIN" test -v -count=1 -timeout 120s ./...
 }
 
 run_unit_tests() {
     info "Running unit tests (no VPP required)..."
     cd "$REPO_DIR"
-    go test -v -count=1 -run 'TestParse|TestResolve|TestAddr|TestOp|TestTimeout|TestTcp|TestErr|TestNet' .
-    go test -v -count=1 -run 'TestIPBE|TestPortBE|TestIsAgain' ./internal/vclpoll/
+    "$GO_BIN" test -v -count=1 -run 'TestParse|TestResolve|TestAddr|TestOp|TestTimeout|TestTcp|TestErr|TestNet' .
+    "$GO_BIN" test -v -count=1 -run 'TestIPBE|TestPortBE|TestIsAgain' ./internal/vclpoll/
 }
 
 run_integration_tcp() {
@@ -77,10 +85,10 @@ run_integration_tcp() {
     cd "$REPO_DIR"
     LD_LIBRARY_PATH="$VPP_LIB" \
     VCL_CONFIG="$VCL_CONF" \
-        go test -v -count=1 -timeout 120s -run 'TestTCP' .
+        "$GO_BIN" test -v -count=1 -timeout 120s -run 'TestTCP' .
     LD_LIBRARY_PATH="$VPP_LIB" \
     VCL_CONFIG="$VCL_CONF" \
-        go test -v -count=1 -timeout 120s -run 'TestEcho' ./internal/vclpoll/
+        "$GO_BIN" test -v -count=1 -timeout 120s -run 'TestEcho' ./internal/vclpoll/
 }
 
 run_integration_http() {
@@ -88,21 +96,21 @@ run_integration_http() {
     cd "$REPO_DIR"
     LD_LIBRARY_PATH="$VPP_LIB" \
     VCL_CONFIG="$VCL_CONF" \
-        go test -v -count=1 -timeout 120s -run 'TestHTTP' .
+        "$GO_BIN" test -v -count=1 -timeout 120s -run 'TestHTTP' .
 }
 
 run_manual_echo() {
     info "Starting echo_server_net in background..."
     cd "$REPO_DIR"
     LD_LIBRARY_PATH="$VPP_LIB" VCL_CONFIG="$VCL_CONF" \
-        go run ./examples/echo_server_net -port 9876 >/tmp/vclnet-server.log 2>&1 &
+        "$GO_BIN" run ./examples/echo_server_net -port 9876 >/tmp/vclnet-server.log 2>&1 &
     local srv=$!
     trap "kill $srv 2>/dev/null || true" EXIT
     sleep 2
 
     info "Running echo_client_net..."
     LD_LIBRARY_PATH="$VPP_LIB" VCL_CONFIG="$VCL_CONF" \
-        go run ./examples/echo_client_net -addr 127.0.0.1:9876 -msg "hello vclnet"
+        "$GO_BIN" run ./examples/echo_client_net -addr 127.0.0.1:9876 -msg "hello vclnet"
 
     info "Server log:"
     cat /tmp/vclnet-server.log
@@ -112,14 +120,14 @@ run_manual_http() {
     info "Starting http_server in background..."
     cd "$REPO_DIR"
     LD_LIBRARY_PATH="$VPP_LIB" VCL_CONFIG="$VCL_CONF" \
-        go run ./examples/http_server -port 8080 >/tmp/vclnet-http.log 2>&1 &
+        "$GO_BIN" run ./examples/http_server -port 8080 >/tmp/vclnet-http.log 2>&1 &
     local srv=$!
     trap "kill $srv 2>/dev/null || true" EXIT
     sleep 2
 
     info "Running http_client..."
     LD_LIBRARY_PATH="$VPP_LIB" VCL_CONFIG="$VCL_CONF" \
-        go run ./examples/http_client -url http://127.0.0.1:8080/health
+        "$GO_BIN" run ./examples/http_client -url http://127.0.0.1:8080/health
 
     info "Server log:"
     cat /tmp/vclnet-http.log

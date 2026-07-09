@@ -4,7 +4,7 @@ import (
 	"context"
 	"net"
 
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 // addrFromInfo converts a vclpoll.AddrInfo to a *net.TCPAddr.

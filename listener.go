@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 // tcpListener implements net.Listener over a VLS listening session.

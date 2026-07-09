@@ -319,12 +319,14 @@ See [../summary.md](../summary.md#2-test-inventory) for current counts and
 
 ## Appendix: current build binding
 
-`internal/vclpoll/cgo.go` currently links against:
+`internal/vclpoll/cgo.go` links against `libvppcom` through pkg-config
+(`#cgo pkg-config: vppcom`). The repository ships
+`pkgconfig/vppcom.pc.in`, and `make pc VPP_PREFIX=…` renders a local
+`pkgconfig/vppcom.pc` that resolves `-I`, `-L`, `-lvppcom`, and the
+`-Wl,-rpath,${libdir}` linker flag from the chosen install prefix.
 
-```text
-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/include
-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/lib/x86_64-linux-gnu
-```
-
-The rpath is embedded in built binaries. This is convenient for this workspace
-but not portable packaging; replacing it is a P0 item.
+Because the rpath is baked into the resulting binary, the runtime loader
+still finds `libvppcom.so` at that absolute path without `LD_PRELOAD` or
+`LD_LIBRARY_PATH`. Only the compile step needs pkg-config to see the file
+(pass `PKG_CONFIG_PATH=$PWD/pkgconfig` or use the Makefile targets, which do
+this automatically).

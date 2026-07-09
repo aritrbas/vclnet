@@ -12,10 +12,18 @@ canonical pending-work list before committing to production adoption.
 - A running VPP process and an accessible app socket at runtime.
 - A `VCL_CONFIG` file.
 
-The source currently contains workstation-specific CGo paths under
-`/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp`. Portable VPP
-discovery is pending, so a clean build on another host requires adjusting those
-directives first.
+Build discovery is driven by `pkg-config: vppcom`. VPP does not ship a `.pc`
+file today, so the repository provides `pkgconfig/vppcom.pc.in`; render it once
+per install prefix and it becomes visible to `pkg-config`:
+
+```bash
+make pc VPP_PREFIX=/opt/vpp
+export PKG_CONFIG_PATH="$PWD/pkgconfig:$PKG_CONFIG_PATH"
+```
+
+The Makefile's `build`, `unit`, `race`, `test`, and `vet` targets auto-run
+`make pc` and prefix the correct `PKG_CONFIG_PATH` themselves. Set
+`VCLNET_SKIP_PC=1` if you have already installed a system-wide `vppcom.pc`.
 
 VPP startup must include:
 
@@ -275,8 +283,30 @@ ENV VCL_CONFIG=/etc/vpp/vcl.conf
 CMD ["/service"]
 ```
 
-The current hard-coded build rpath makes a relocatable image incomplete. Treat
-portable container packaging as part of the P0 build-discovery work.
+Build-time discovery uses the `pkg-config` file rendered from
+`pkgconfig/vppcom.pc.in`. Multi-stage Dockerfiles typically do this once in a
+builder stage:
+
+```dockerfile
+FROM golang:1.26 AS build
+COPY --from=vpp /opt/vpp /opt/vpp
+COPY . /src
+WORKDIR /src
+RUN make pc VPP_PREFIX=/opt/vpp \
+ && PKG_CONFIG_PATH=/src/pkgconfig go build -o /out/service ./cmd/service
+
+FROM debian:bookworm-slim
+COPY --from=vpp /opt/vpp/lib /opt/vpp/lib
+COPY --from=build /out/service /usr/local/bin/service
+ENV LD_LIBRARY_PATH=/opt/vpp/lib/x86_64-linux-gnu \
+    VCL_CONFIG=/etc/vpp/vcl.conf
+CMD ["service"]
+```
+
+Because the rendered `.pc` file embeds `-Wl,-rpath,${libdir}`, the runtime
+loader can find `libvppcom.so` at the same absolute path used during the build
+even without `LD_LIBRARY_PATH`. Set `LD_LIBRARY_PATH` explicitly if the runtime
+image places the VPP libraries elsewhere.
 
 ## 11. Adoption checklist
 

@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"vclnet"
+	"github.com/aritrbas/vclnet"
 )
 
 func main() {

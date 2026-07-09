@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 // --- parseNetwork tests ---

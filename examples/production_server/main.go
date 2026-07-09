@@ -14,7 +14,7 @@ import (
 	"os"
 	"sync/atomic"
 
-	"vclnet"
+	"github.com/aritrbas/vclnet"
 )
 
 var requestCount atomic.Int64

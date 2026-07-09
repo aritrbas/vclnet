@@ -5,7 +5,7 @@ import (
 	"net"
 	"time"
 
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 const defaultFallbackDelay = 250 * time.Millisecond

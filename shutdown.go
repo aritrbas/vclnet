@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 var (

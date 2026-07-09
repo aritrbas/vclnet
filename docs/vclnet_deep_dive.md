@@ -677,13 +677,11 @@ Putting it all together, here are the **specific** ways naive goroutine + VCL co
 
 ### 10.2 Build & link
 
-`internal/vclpoll/cgo.go` opens with a CGo preamble that pulls in VPP's headers and links against `libvppcom.so`:
+`internal/vclpoll/cgo.go` opens with a CGo preamble that resolves VPP's headers and library through pkg-config:
 
 ```go
 /*
-#cgo CFLAGS: -I/.../vpp/include
-#cgo LDFLAGS: -L/.../vpp/lib/x86_64-linux-gnu -lvppcom \
-              -Wl,-rpath,/.../vpp/lib/x86_64-linux-gnu
+#cgo pkg-config: vppcom
 
 #include <vcl/vppcom.h>
 #include <vcl/vcl_locked.h>
@@ -691,7 +689,7 @@ Putting it all together, here are the **specific** ways naive goroutine + VCL co
 import "C"
 ```
 
-So the build picks up VPP's headers, links against `libvppcom`, and bakes an rpath so the runtime loader can find the shared library without `LD_PRELOAD` or `LD_LIBRARY_PATH`.
+Since VPP does not ship a `.pc` file today, the repository provides `pkgconfig/vppcom.pc.in` and a `make pc VPP_PREFIX=/path/to/vpp` target that renders `pkgconfig/vppcom.pc` for a specific install. The rendered file emits `-I${includedir}`, `-L${libdir}`, `-lvppcom`, and `-Wl,-rpath,${libdir}`, so a build picks up VPP's headers, links against `libvppcom`, and bakes an rpath so the runtime loader can find the shared library without `LD_PRELOAD` or `LD_LIBRARY_PATH`. The Makefile targets (`build`, `unit`, `race`, `test`, `vet`) prepend the repo's `pkgconfig/` to `PKG_CONFIG_PATH` automatically.
 
 ### 10.3 Surface area
 

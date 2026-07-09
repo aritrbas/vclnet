@@ -1,13 +1,16 @@
 #!/bin/bash
 # start_vpp.sh — Start VPP for integration testing.
 #
-# Uses the release build by default (matching the cgo linker rpath in
-# internal/vclpoll/cgo.go). Override VPP_BIN / VPPCTL to point at the
-# debug build if you need extra logging.
+# VPP paths are resolved by test/env.sh. Override VPP_PREFIX (or the individual
+# VPP_BIN / VPPCTL / VPP_LIB variables) on the environment for non-default
+# installs.
 set -e
 
-VPP_BIN="${VPP_BIN:-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/bin/vpp}"
-VPPCTL="${VPPCTL:-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/bin/vppctl}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=env.sh
+source "$SCRIPT_DIR/env.sh"
+require_vpp_paths
+
 CLI_SOCK=/run/vpp/cli.sock
 APP_SOCK=/run/vpp/app_ns_sockets/default
 
@@ -23,7 +26,7 @@ sudo "$VPP_BIN" \
   session { enable use-app-socket-api }
 
 echo "Waiting for VPP to start..."
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
     if [ -S "$CLI_SOCK" ] && [ -S "$APP_SOCK" ]; then
         break
     fi
@@ -32,7 +35,7 @@ done
 
 if [ ! -S "$APP_SOCK" ]; then
     echo "ERROR: VPP app socket not found after 20s"
-    cat /tmp/vpp.log | tail -20
+    tail -20 /tmp/vpp.log || true
     exit 1
 fi
 

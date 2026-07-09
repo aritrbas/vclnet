@@ -1,25 +1,27 @@
 #!/bin/bash
-# Run only vclpoll integration tests with a fresh VPP.
+# run_vclpoll_only.sh — Run only vclpoll integration tests with a fresh VPP.
 #
-# Uses the VPP release build by default so it matches the cgo linker rpath
-# in internal/vclpoll/cgo.go. Override VPP_BIN/VPPCTL/LIB_PATH if you need
-# to test against the debug build.
+# VPP paths and the invoking user are resolved by test/env.sh. Override
+# VPP_PREFIX (or VPP_BIN + VPPCTL + VPP_LIB) and RUN_AS_USER on the environment
+# if you're not using the defaults. `sudo -E` preserves those overrides.
 set -e
 
-VPP_BIN="${VPP_BIN:-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/bin/vpp}"
-VPPCTL="${VPPCTL:-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/bin/vppctl}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VCLNET_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# shellcheck source=env.sh
+source "$SCRIPT_DIR/env.sh"
+require_vpp_paths
+
 CLI_SOCK=/run/vpp/cli.sock
 APP_SOCK=/run/vpp/app_ns_sockets/default
 VCL_CONF=/tmp/vclnet-share/vcl.conf
-LIB_PATH="${LIB_PATH:-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/lib/x86_64-linux-gnu}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VCLNET_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VPP_PID=""
 cleanup() {
     if [ -n "$VPP_PID" ]; then
-        kill $VPP_PID 2>/dev/null || true
-        wait $VPP_PID 2>/dev/null || true
+        kill "$VPP_PID" 2>/dev/null || true
+        wait "$VPP_PID" 2>/dev/null || true
         echo "VPP stopped."
     fi
 }
@@ -48,7 +50,7 @@ EOF
 VPP_PID=$!
 
 echo "VPP PID: $VPP_PID"
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
     if [ -S "$CLI_SOCK" ] && [ -S "$APP_SOCK" ]; then break; fi
     sleep 1
 done
@@ -64,12 +66,12 @@ chmod o+w "$CLI_SOCK" "$APP_SOCK"
 "$VPPCTL" -s "$CLI_SOCK" set interface ip address loop0 ::1/128
 echo "Loopback ready"
 
+if [ -f "$VCLNET_DIR/pkgconfig/vppcom.pc" ]; then
+    export PKG_CONFIG_PATH="$VCLNET_DIR/pkgconfig:${PKG_CONFIG_PATH:-}"
+fi
+
 cd "$VCLNET_DIR"
 echo "=== Running vclpoll tests ONLY ==="
-sudo -u aritrbas env \
-  LD_LIBRARY_PATH="$LIB_PATH" \
-  VCL_CONFIG="$VCL_CONF" \
-  PATH="$PATH" \
-  HOME=/home/aritrbas \
-  /usr/local/go/bin/go test -v -count=1 -timeout 60s -run 'TestEchoSingleRoundTrip' ./internal/vclpoll/ 2>&1
+VCL_CONFIG="$VCL_CONF" \
+    run_as_user "$GO_BIN" test -v -count=1 -timeout 60s -run 'TestEchoSingleRoundTrip' ./internal/vclpoll/ 2>&1
 echo "exit code: $?"

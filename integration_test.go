@@ -45,8 +45,8 @@ import (
 	"testing"
 	"time"
 
-	"vclnet"
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 const (

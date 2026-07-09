@@ -16,7 +16,7 @@ import (
 	"net"
 	"os"
 
-	"vclnet"
+	"github.com/aritrbas/vclnet"
 )
 
 func main() {

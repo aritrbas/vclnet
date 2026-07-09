@@ -17,7 +17,7 @@ import (
 	"net"
 	"time"
 
-	"vclnet/internal/vclpoll"
+	"github.com/aritrbas/vclnet/internal/vclpoll"
 )
 
 const defaultBacklog = 128

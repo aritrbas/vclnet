@@ -17,7 +17,7 @@ import (
 	"net/http"
 	"os"
 
-	"vclnet"
+	"github.com/aritrbas/vclnet"
 )
 
 func main() {

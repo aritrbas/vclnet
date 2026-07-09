@@ -25,7 +25,6 @@ This repository should still be treated as pre-production infrastructure:
 - VLS runs in single-worker multi-thread mode (mode 3). VPP may have multiple
   workers, but application-side VLS calls still serialize. Enabling
   `multi-thread-workers` is not supported by the current shared poller.
-- CGo include/library paths are tied to the local VPP build tree.
 - Benchmarks exist, but the repository does not contain a reproducible
   kernel-vs-VPP baseline. Treat performance claims as hypotheses until measured
   on the target hardware and topology.
@@ -60,7 +59,7 @@ import (
     "log"
     "net/http"
 
-    "vclnet"
+    "github.com/aritrbas/vclnet"
 )
 
 func main() {
@@ -153,14 +152,40 @@ admitting work before shutdown.
 The module declares Go 1.26 or newer. This workspace was validated with Go
 1.26.1 and a VPP 26.06 development build.
 
-The current CGo directives expect this VPP release-build tree:
+### VPP discovery via pkg-config
 
-```text
-/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp/
+`internal/vclpoll/cgo.go` links against `libvppcom` with `#cgo pkg-config: vppcom`.
+VPP does not currently ship a `.pc` file, so this repository provides one:
+`pkgconfig/vppcom.pc.in` is a template rendered on demand by `make pc`.
+
+For a typical build, tell the Makefile where VPP is installed:
+
+```bash
+make pc VPP_PREFIX=/opt/vpp
+make build            # bin/echo_server, bin/http_server, …
+make unit             # `go test` on the module and internal/vclpoll
 ```
 
-In particular, `internal/vclpoll/cgo.go` refers to its `include` directory
-and `lib/x86_64-linux-gnu/libvppcom.so`. Making this configurable is pending.
+`make build`, `make unit`, `make test`, `make race`, and `make vet` all
+auto-run `make pc` first. If you also want `go build` / `go test` invoked
+directly to pick up the pkg-config file, export `PKG_CONFIG_PATH`:
+
+```bash
+export PKG_CONFIG_PATH="$PWD/pkgconfig:$PKG_CONFIG_PATH"
+go build ./...
+```
+
+Advanced overrides:
+
+| Variable         | Meaning                                          | Default                                          |
+| ---------------- | ------------------------------------------------ | ------------------------------------------------ |
+| `VPP_PREFIX`     | Install root that contains `include/` and libs   | (required unless the other three are set)        |
+| `VPP_INCLUDEDIR` | Directory holding `vcl/vppcom.h`                 | `$VPP_PREFIX/include`                            |
+| `VPP_LIBDIR`     | Directory holding `libvppcom.so`                 | `$VPP_PREFIX/lib/$(dpkg-architecture …)` or `lib`|
+| `VPP_VERSION`    | Free-form version string                         | `0.0.0`                                          |
+| `VCLNET_SKIP_PC` | Set to `1` if you already installed `vppcom.pc` system-wide | unset                                     |
+
+### VPP runtime configuration
 
 VPP must run with:
 
@@ -185,22 +210,32 @@ Set `VCL_CONFIG` to that file before starting the application.
 
 ## Tests
 
-No-VPP validation:
+No-VPP validation (still needs `pkg-config` to find `vppcom.pc` because CGo
+resolves link flags at compile time — the tests self-skip if VPP is not
+actually running):
 
 ```bash
-go test -count=1 ./...
-go test -race -count=1 ./...
-go vet ./...
-make build
+make pc VPP_PREFIX=/opt/vpp   # once; git-ignored output
+make unit                     # go test on the module + internal/vclpoll
+make race                     # go test -race
+make vet
+make build                    # every example
 ```
+
+If you invoke `go test` / `go build` directly, either export
+`PKG_CONFIG_PATH="$PWD/pkgconfig:$PKG_CONFIG_PATH"` or install a system-wide
+`vppcom.pc`.
 
 The integration files skip when `VCL_CONFIG` is absent. The dedicated
 harness starts and stops an isolated VPP instance:
 
 ```bash
-sudo bash test/run_integration.sh
-sudo bash test/run_multiworker.sh 4
+sudo -E bash test/run_integration.sh
+sudo -E bash test/run_multiworker.sh 4
 ```
+
+`sudo -E` preserves `VPP_PREFIX`, `RUN_AS_USER`, and other overrides consumed
+by `test/env.sh` — see that file for the full list.
 
 Current top-level coverage consists of:
 
@@ -228,11 +263,13 @@ multi-worker stress.
 |-- vclnet_test.go               no-VPP contract tests
 |-- integration_test.go          VPP integration tests and benchmarks
 |-- internal/vclpoll/
-|   |-- cgo.go                   VLS CGo bridge
+|   |-- cgo.go                   VLS CGo bridge (links via pkg-config)
 |   |-- poller.go                shared readiness poller
 |   `-- *_test.go                helper and VPP integration tests
+|-- pkgconfig/vppcom.pc.in       template for VPP discovery (see Build)
 |-- examples/                    echo, HTTP, and concurrency examples
-|-- test/                        VPP test/demo runners
+|-- test/env.sh                  shared VPP path / user detection helper
+|-- test/run_*.sh                VPP test/demo runners
 |-- docs/architecture.md         design and Frida migration rationale
 |-- docs/vclnet_deep_dive.md     VPP/VCL/VLS internals
 |-- docs/adoption_guide.md       application integration guide

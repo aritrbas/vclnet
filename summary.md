@@ -71,7 +71,6 @@ instead of maintaining independent roadmaps.
 
 | Priority | Work item | Completion criteria |
 | --- | --- | --- |
-| P0 | Portable VPP discovery and module packaging | Remove workstation-specific CGo/repository paths; support an explicit prefix or pkg-config; choose a publishable Go module path; build in a clean environment |
 | P0 | Automated compatibility CI | Run unit/race/vet plus isolated VPP integration against a documented VPP version matrix; retain logs and fail on unexpected skips |
 | P1 | Decide and implement the unconnected UDP contract | Either implement a per-peer session adapter that provides correct `PacketConn` semantics (including concurrent peers), or remove/deprecate `ListenPacket`; enable the currently skipped integration test |
 | P1 | Verify asynchronous connect completion errors | Replace the current EPOLLOUT-implies-success assumption when VPP exposes a reliable session error query, and add refused/unreachable integration cases |
@@ -95,14 +94,12 @@ instead of maintaining independent roadmaps.
    `multi-thread-workers` mode, a session belongs to the thread/worker that
    created it. The single poller touching every session would trigger migration
    paths that fail for active sessions.
-4. **Build paths are local.** CGo directives point at
-   `/home/aritrbas/vpp/vpp/build-root/install-vpp-native/vpp`.
-5. **Client and server need separate VCL apps.** The test topology uses
+4. **Client and server need separate VCL apps.** The test topology uses
    subprocesses because a process cannot connect back to a listener in the same
    VCL app.
-6. **Release VPP is the validated target.** A cut-through cleanup race was
+5. **Release VPP is the validated target.** A cut-through cleanup race was
    observed with debug VPP builds under overlapping sessions.
-7. **No recorded comparative benchmark is shipped.** Benchmark functions are
+6. **No recorded comparative benchmark is shipped.** Benchmark functions are
    test tools, not evidence for a specific speedup.
 
 ## 5. Architecture snapshot
