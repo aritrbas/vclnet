@@ -29,7 +29,7 @@ Fill in the four placeholders yourself:
 | `@VPP_PREFIX@`      | Install prefix that contains `include/` and libs | `/opt/vpp`                                    |
 | `@VPP_INCLUDEDIR@`  | Directory holding `vcl/vppcom.h`                 | `${prefix}/include`                           |
 | `@VPP_LIBDIR@`      | Directory holding `libvppcom.so`                 | `${prefix}/lib/x86_64-linux-gnu`              |
-| `@VPP_VERSION@`     | Free-form; shown by `pkg-config --modversion`    | `26.06`                                       |
+| `@VPP_VERSION@`     | Free-form; shown by `pkg-config --modversion`    | `26.10`                                       |
 
 The generated `vppcom.pc` file is git-ignored — check in the template only.
 

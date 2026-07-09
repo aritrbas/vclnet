@@ -1,13 +1,23 @@
 #!/bin/bash
 # run_integration.sh — Start VPP, run integration tests, stop VPP.
 #
-# Usage: sudo -E bash run_integration.sh [test-filter]
-# Example: sudo -E bash run_integration.sh TestTCPIPv4EchoSingle
+# Usage: sudo -E bash run_integration.sh [--mode 2|3] [test-filter]
+# Example: sudo -E bash run_integration.sh --mode 2 TestTCPIPv4EchoSingle
 #
 # VPP paths and the invoking user are resolved by test/env.sh. Override
 # VPP_PREFIX (or VPP_BIN + VPPCTL + VPP_LIB) and RUN_AS_USER on the environment
 # for non-default installs. `sudo -E` preserves those overrides.
 set -e
+
+VLS_MODE=3
+if [ "${1:-}" = "--mode" ]; then
+    VLS_MODE="${2:-}"
+    shift 2
+fi
+if [ "$VLS_MODE" != "2" ] && [ "$VLS_MODE" != "3" ]; then
+    echo "ERROR: --mode must be 2 or 3"
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VCLNET_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -40,8 +50,13 @@ mkdir -p /tmp/vclnet-test/app_ns_sockets
 
 # Ensure VCL config exists.
 mkdir -p /tmp/vclnet-share
-cat > "$VCL_CONF" <<'EOF'
+MODE_TOKEN=""
+if [ "$VLS_MODE" = "2" ]; then
+    MODE_TOKEN="  multi-thread-workers"
+fi
+cat > "$VCL_CONF" <<EOF
 vcl {
+$MODE_TOKEN
   rx-fifo-size 4000000
   tx-fifo-size 4000000
   app-scope-local
@@ -97,10 +112,15 @@ fi
 
 cd "$VCLNET_DIR"
 
-echo "=== Running vclnet integration tests (filter: $TEST_FILTER) ==="
+echo "=== Running vclnet integration tests (filter: $TEST_FILTER, VLS mode: $VLS_MODE) ==="
 set +e
+MODE_ENV=()
+if [ "$VLS_MODE" = "2" ]; then
+    MODE_ENV=(VCLNET_VLS_MODE=2 VCLNET_WORKERS=1)
+fi
 VCL_CONFIG="$VCL_CONF" \
-    run_as_user "$GO_BIN" test -v -count=1 -timeout 120s -run "$TEST_FILTER" . 2>&1
+    run_as_user env "${MODE_ENV[@]}" VCL_CONFIG="$VCL_CONF" \
+    "$GO_BIN" test -v -count=1 -timeout 120s -run "$TEST_FILTER" . 2>&1
 TEST_RC=$?
 set -e
 
@@ -118,6 +138,21 @@ VPP_PID=""
 sleep 1
 rm -rf /tmp/vclnet-test
 mkdir -p /tmp/vclnet-test/app_ns_sockets
+
+# vclpoll tests always use Mode 3 (vclpoll.AppInit hardcodes Mode 3), so
+# write a plain VCL config without multi-thread-workers regardless of the
+# top-level VLS_MODE selection.
+VCLPOLL_CONF=/tmp/vclnet-share/vcl-vclpoll.conf
+cat > "$VCLPOLL_CONF" <<'EOF'
+vcl {
+  rx-fifo-size 4000000
+  tx-fifo-size 4000000
+  app-scope-local
+  app-scope-global
+  use-mq-eventfd
+  app-socket-api /tmp/vclnet-test/app_ns_sockets/default
+}
+EOF
 
 "$VPP_BIN" \
   unix { nodaemon log /tmp/vpp.log full-coredump cli-listen "$CLI_SOCK" runtime-dir /tmp/vclnet-test } \
@@ -145,8 +180,9 @@ sleep 2  # Give VPP session layer time to fully initialize
 
 echo "=== Running vclpoll integration tests ==="
 set +e
-VCL_CONFIG="$VCL_CONF" \
-    run_as_user "$GO_BIN" test -v -count=1 -timeout 120s -run 'TestEcho' ./internal/vclpoll/ 2>&1
+VCL_CONFIG="$VCLPOLL_CONF" \
+    run_as_user env VCL_CONFIG="$VCLPOLL_CONF" \
+    "$GO_BIN" test -v -count=1 -timeout 120s -run 'TestEcho' ./internal/vclpoll/ 2>&1
 VCLPOLL_RC=$?
 set -e
 

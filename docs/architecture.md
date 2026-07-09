@@ -165,7 +165,7 @@ dispatcher exposes process-unique internal handles mapped to `{worker, raw}`.
 Before touching a raw session it checks `vlsh_to_session_and_worker_index`; a
 mismatch is rejected and counted before VLS can migrate or clone the session.
 
-Mode 2 requires `multi-thread-workers` in `vcl.conf`. The pinned VPP 26.06
+Mode 2 requires `multi-thread-workers` in `vcl.conf`. The pinned VPP 26.10
 library does not export `vls_use_workers_only`; the configuration token is the
 supported switch and initialization verifies it with `vls_mt_wrk_supported`.
 
@@ -249,7 +249,7 @@ The server-side VPP UDP model is session-oriented: a bound/listening UDP VLS han
 accepts per-peer sessions. vclnet does not yet translate that model into
 arbitrary-peer `PacketConn` semantics.
 
-Mode 2 UDP is deliberately unavailable on the pinned VPP 26.06 build because
+Mode 2 UDP is deliberately unavailable on the pinned VPP 26.10 build because
 closing a cut-through datagram session can leave VPP with a stale TX event.
 
 ## 8. Addressing

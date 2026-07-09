@@ -29,7 +29,7 @@ This repository should still be treated as pre-production infrastructure:
   session-affine, lifetime-pinned workers with per-worker epoll and no shared
   poller. It requires `multi-thread-workers` and remains behind rollout, soak,
   and performance gates.
-- Mode 2 currently admits TCP sessions only. With the pinned VPP 26.06 build,
+- Mode 2 currently admits TCP sessions only. With the pinned VPP 26.10 build,
   connected UDP can crash VPP during cut-through cleanup, so Mode 2 rejects
   every UDP entry point with an error wrapping `EOPNOTSUPP` before allocating
   VLS state. Use Mode 3 for UDP.
@@ -55,7 +55,7 @@ The canonical, prioritized pending-work list is in
 | `Transport` / `NewHTTPClient` | HTTP/1.1 integration covered |
 | `crypto/tls` layered over a vclnet TCP connection | Integrated |
 | Native VCL TLS (`VPPCOM_PROTO_TLS`) via `DialTLS` / `ListenTLS` | Integrated; VPP terminates TLS, no `crypto/tls` on the caller side |
-| TCP `CloseRead` / `CloseWrite` | Integrated via `vls_shutdown` (SHUT_RD is local-only EOF; SHUT_WR sends a peer FIN) |
+| TCP `CloseRead` / `CloseWrite` | Integrated via `vls_shutdown` (SHUT_RD is local-only EOF; SHUT_WR sends a peer FIN over full TCP; no-op over cut-through transport) |
 
 DNS resolution uses Go's normal resolver. Only the connection data path is
 routed through VPP.
@@ -266,7 +266,7 @@ admitting work before shutdown.
 ## Build and runtime requirements
 
 The module declares Go 1.26 or newer. This workspace was validated with Go
-1.26.1 and a VPP 26.06 development build.
+1.26.1 and a VPP 26.10 development build.
 
 ### VPP discovery via pkg-config
 
@@ -378,9 +378,9 @@ by `test/env.sh` — see that file for the full list.
 
 Current top-level coverage consists of:
 
-- 141 no-VPP tests across the public package, Mode 3 poller, and Mode 2 workers;
-- 26 runnable public-package single-worker integration tests, plus one
-  deliberately skipped unconnected-UDP test;
+- 152 no-VPP tests across the public package, Mode 3 poller, and Mode 2 workers;
+- 32 runnable public-package single-worker integration tests, plus two
+  deliberately skipped tests (unconnected-UDP and half-close over cut-through);
 - 2 low-level VCL poll integration tests;
 - 5 multi-worker stress tests plus 2 Mode 2 invariants for ownership and safe
   UDP rejection;
@@ -427,6 +427,10 @@ multi-worker stress.
 
 - A VCL app cannot connect to its own listener in these tests. Client and
   server run as separate processes.
+- TCP `CloseWrite` (half-close) does not deliver peer EOF over VPP's
+  cut-through transport. When both endpoints attach to the same VPP with
+  `app-scope-local`, `transport_half_close` is a no-op for the CT protocol.
+  Half-close works correctly over the full TCP transport.
 - Mode 3 remains the default. Mode 2 is opt-in, requires
   `multi-thread-workers`, permanently pins one OS thread per worker, and uses a
   single owner worker per listener until listener sharding is implemented.

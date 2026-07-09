@@ -771,7 +771,7 @@ owner-local handle.
 ### 11.3 Initialization and teardown constraints
 
 Mode 2 requires `multi-thread-workers` in `vcl.conf`; initialization verifies
-`vls_mt_wrk_supported`. The pinned VPP 26.06 build has no exported
+`vls_mt_wrk_supported`. The pinned VPP 26.10 build has no exported
 `vls_use_workers_only` symbol, so the config token is the supported switch.
 
 Shutdown wakes waiters, closes sessions on their owners, drains bounded VPP
@@ -1271,7 +1271,7 @@ Mode 2 completes soak, listener-sharding, and performance rollout gates.
 
 ### 15.1 Cut-through cleanup races in the pinned VPP build
 
-The pinned VPP 26.06 release build exposed a deterministic Mode 2 connected-UDP
+The pinned VPP 26.10 release build exposed a deterministic Mode 2 connected-UDP
 cleanup failure while this refactor was validated. VPP could execute a queued
 cut-through TX event after the session had been released and crash here:
 

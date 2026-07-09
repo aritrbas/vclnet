@@ -20,7 +20,7 @@ validation, and a decision on the incomplete unconnected-UDP API. Mode 3
 remains the compatibility default. An opt-in Mode 2 implementation now uses
 fixed, session-affine worker loops for application-side parallelism, but
 its rollout still requires sustained CI, listener sharding, soak testing, and a
-performance baseline. The pinned VPP 26.06 build crashes during Mode 2
+performance baseline. The pinned VPP 26.10 build crashes during Mode 2
 cut-through UDP cleanup, so Mode 2 rejects UDP before allocating VLS state and
 preserves `errors.Is(err, syscall.EOPNOTSUPP)`.
 
@@ -86,14 +86,15 @@ thread.
 
 ## 3. Current evidence
 
-The no-VPP suite has 160 top-level tests. The VPP-backed suites contain:
+The no-VPP suite has 152 top-level tests. The VPP-backed suites contain:
 
-- 33 runnable public-package single-worker tests (including four native
-  VCL TLS integration tests);
+- 32 runnable public-package single-worker tests (including native VCL TLS,
+  half-close, layered TLS, deadline, and Happy Eyeballs tests);
 - 2 low-level VCL poll tests;
 - 5 multi-worker stress tests plus 2 Mode 2 ownership and UDP-rejection
   invariant tests;
-- 1 intentionally skipped unconnected-UDP test;
+- 2 deliberately skipped tests (unconnected-UDP and half-close over
+  cut-through transport);
 - 2 opt-in benchmarks.
 
 Covered behavior includes:
@@ -115,7 +116,7 @@ Covered behavior includes:
 - multiple VPP worker threads with concurrent connection and HTTP stress;
 - shutdown before Init and shutdown waking a blocked accept.
 
-The local audit uses Go 1.26.1 and a VPP 26.06 development build from the
+The local audit uses Go 1.26.1 and a VPP 26.10 development build from the
 release-build tree. This is local evidence, not yet a compatibility matrix.
 
 ## 4. What the evidence does not establish

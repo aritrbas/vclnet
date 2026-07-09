@@ -12,7 +12,7 @@ VCL worker.
 | Area | Current behavior | Validation |
 | --- | --- | --- |
 | TCP | Listen, accept, dial, read, write, close, and half-close on IPv4 and IPv6 | Unit plus VPP integration |
-| TCP half-close | `CloseRead` and `CloseWrite` route to `vls_shutdown(SHUT_RD/SHUT_WR)`; SHUT_WR emits a peer FIN, SHUT_RD is local-only. Parity with `net.TCPConn` error shapes | Unit state tests plus VPP integration (`halfclose` server, wake-parked-writer) |
+| TCP half-close | `CloseRead` and `CloseWrite` route to `vls_shutdown(SHUT_RD/SHUT_WR)`; SHUT_WR emits a peer FIN, SHUT_RD is local-only. Does not work over cut-through transport (see limitation 10) | Unit state tests plus VPP integration (wake-parked-writer, local-EOF); peer-EOF test skipped under CT |
 | Context dialing | TCP in both modes and connected UDP in Mode 3 honor cancellation while resolving or connecting | Unit plus VPP integration for successful paths |
 | Happy Eyeballs | Unsuffixed `"tcp"` interleaves IPv6 and IPv4 attempts with a configurable stagger and closes successful losers | Localhost VPP integration plus helper tests |
 | Deadlines | Resettable read and write deadlines wake operations already parked for readiness | Timer unit tests plus TCP and Mode 3 UDP VPP integration |
@@ -41,7 +41,7 @@ VCLNET_WORKERS=4
 
 Its `vcl.conf` must contain `multi-thread-workers`. Mode 3 remains the default
 until sustained CI and a reproducible performance baseline justify a rollout
-change. Mode 2 UDP remains disabled because the pinned VPP 26.06 build crashes
+change. Mode 2 UDP remains disabled because the pinned VPP 26.10 build crashes
 while cleaning up cut-through datagram TX state; callers receive an error
 wrapping `EOPNOTSUPP` before any VLS datagram session is created.
 
@@ -56,7 +56,7 @@ large-payload, ownership, UDP-rejection, VPP-liveness, and process-exit checks.
 That evidence does **not** make Mode 2 production-stable yet. Two compatibility
 gaps remain release blockers:
 
-- **UDP:** VPP 26.06 crashes while cleaning up Mode 2 cut-through datagram
+- **UDP:** VPP 26.10 crashes while cleaning up Mode 2 cut-through datagram
   state. vclnet fails closed with `EOPNOTSUPP`; Mode 2 is TCP-only until the VPP
   defect is reproduced and fixed upstream or a verified-safe build is selected.
 - **Worker retirement:** teardown currently waits for non-bootstrap worker
@@ -68,9 +68,9 @@ gaps remain release blockers:
 
 ## 2. Test inventory
 
-The repository currently has 165 top-level no-VPP tests:
+The repository currently has 152 top-level no-VPP tests:
 
-- 142 public-package contract and unit tests (adds 13 native VCL TLS
+- 129 public-package contract and unit tests (including native VCL TLS
   contract tests covering server-side cert requirement, client-side
   anonymous mode, partial-config rejection, UDP-network rejection,
   unknown-network rejection, canceled-context short-circuit, hash-based
@@ -81,12 +81,11 @@ The repository currently has 165 top-level no-VPP tests:
 
 VPP-backed coverage currently has:
 
-- 33 runnable public-package tests in the standard integration harness
-  (adds `TestNativeVCLTLSEchoSingle`, `TestNativeVCLTLSEchoLarge`,
-  `TestNativeVCLTLSVsLayeredTLSFunctionalParity`, and
-  `TestNativeVCLTLSListenValidation` on top of the existing half-close and
-  layered-TLS tests);
-- 1 deliberately skipped unconnected-UDP `PacketConn` test;
+- 32 runnable public-package tests in the standard integration harness
+  (including native VCL TLS, half-close, layered-TLS, deadline,
+  Happy Eyeballs, shutdown, and address tests);
+- 2 deliberately skipped tests (unconnected-UDP `PacketConn` and
+  half-close over cut-through transport);
 - 2 low-level vclpoll echo tests;
 - 5 multi-worker stress tests plus 2 Mode 2 ownership and UDP-rejection
   invariant tests;
@@ -141,7 +140,7 @@ maintaining independent roadmaps.
 1. **Unconnected UDP is incomplete.** `ListenPacket` can create a bound VLS
    listener, but arbitrary peer-oriented `ReadFrom` and `WriteTo` behavior is
    not implemented end to end. Use connected UDP in Mode 3.
-2. **Mode 2 UDP is disabled.** The pinned VPP 26.06 build can crash after a
+2. **Mode 2 UDP is disabled.** The pinned VPP 26.10 build can crash after a
    Mode 2 connected-UDP close while processing stale cut-through TX state.
    Mode 2 UDP calls therefore fail before VLS allocation with an error wrapping
    `EOPNOTSUPP`; use Mode 3 for connected UDP.
@@ -167,7 +166,13 @@ maintaining independent roadmaps.
 9. **Release VPP is the validated target.** Cut-through cleanup exposed the
    Mode 2 UDP failure above; fail-fast rejection prevents that path and the
    harness treats any VPP process crash as a test failure.
-10. **No comparative benchmark is shipped.** Benchmark functions are test tools,
+10. **TCP half-close does not work over cut-through transport.** When both
+    endpoints connect through the same VPP with `app-scope-local`, VPP selects
+    its cut-through (CT) protocol, which does not implement `half_close`.
+    `CloseWrite` is a no-op at the VPP level and the peer never observes EOF.
+    Half-close works correctly over the full TCP transport (separate VPP
+    instances or without `app-scope-local`).
+11. **No comparative benchmark is shipped.** Benchmark functions are test tools,
    not evidence for a specific speedup.
 
 ## 5. Architecture snapshot

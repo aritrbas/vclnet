@@ -278,7 +278,7 @@ n, err := conn.Read(response)
 
 The Mode 3 connected UDP path supports IPv4, IPv6, context-aware connection
 setup, and resettable deadlines. Mode 2 rejects UDP before VLS allocation with
-an error wrapping `syscall.EOPNOTSUPP` because the pinned VPP 26.06 build can
+an error wrapping `syscall.EOPNOTSUPP` because the pinned VPP 26.10 build can
 crash during cut-through datagram cleanup.
 
 Do not adopt `ListenPacket` for arbitrary peers yet. VPP represents incoming

@@ -15,7 +15,7 @@ import (
 const maxVirtualHandle = uint32(1<<31 - 1)
 
 // ErrMode2UDPUnsupported is returned before creating a VLS datagram session.
-// The VPP 26.06 VLS Mode 2 implementation can leave a cut-through TX event
+// The VPP 26.10 VLS Mode 2 implementation can leave a cut-through TX event
 // referring to freed session state during close, which crashes VPP after the
 // application has otherwise completed successfully.
 var ErrMode2UDPUnsupported = fmt.Errorf("vclpoll: UDP is not supported in VLS mode 2 with this VPP build: %w", syscall.EOPNOTSUPP)
