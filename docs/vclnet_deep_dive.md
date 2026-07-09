@@ -607,9 +607,15 @@ So you can release exactly the right locks on the way out.
 
 **Correctness wise this mode is fine.** Performance wise it's a single VPP worker's worth of bandwidth, no matter how many goroutines you throw at it.
 
-### 8.4 Why both modes still need `LockOSThread` from Go
+### 8.4 Why the wrapper still uses `LockOSThread`
 
-Even in mode 3 — where all threads share one `__vcl_worker_index` — the **per-thread lock-tracking TLS** must stay coherent across a single VLS call. If the goroutine moves between Ms mid-call, the `vls_mt_rel_locks()` path on exit will release locks based on the *new* M's TLS bitmap, which is wrong. So `LockOSThread` is required in every mode.
+Go cannot migrate a goroutine halfway through one CGo call: the C function
+continues on the same M/pthread. The wrapper nevertheless has a wider
+multi-step sequence—inspect/register the current pthread, then enter a
+separate VLS CGo call. Without `LockOSThread`, the goroutine could migrate
+between those crossings. Pinning makes the registered pthread and the
+executing pthread identical. The shared poller's goroutine is pinned for its
+entire lifetime for the same ownership reason.
 
 ### 8.5 The pthread cleanup destructor
 
@@ -630,11 +636,11 @@ Putting it all together, here are the **specific** ways naive goroutine + VCL co
 
 | Failure mode | Mechanism |
 | --- | --- |
-| **Stale `__vcl_worker_index`** | Goroutine migrates between Ms; second VCL call reads `~0` or another worker's index → uses wrong session pool → SEGV or EBADFD. |
-| **Lock-tracking corruption** | `vls_mt_pthread_local` is per-M. Goroutine starts call on M1 (sets `VLS_MT_LOCK_MQ` bit), moves to M2; `vls_mt_unguard` on M2 sees empty bitmap, never releases the mutex on M1 → deadlock for everyone else. |
-| **MQ disappears under you** | Idle M trimmed by Go runtime → glibc runs `vls_mt_del` → `vppcom_worker_unregister` → MQ pair freed → any session that depended on it is orphaned. |
-| **`clib_mem_init` vs Go stack allocator** | First call to `vls_app_create` runs `clib_mem_init` which installs an allocator at fixed addresses. If Go grows stacks afterwards into a colliding region, you get stack corruption / random panics. |
-| **Cross-worker session access (mode 2)** | Two goroutines on different Ms touch the same vlsh; VLS triggers `vls_send_clone_and_share_rpc`; slow + may fail; race-prone. |
+| **Changing `__vcl_worker_index`** | A goroutine can reach later VLS calls on another M. VLS then initializes/selects that pthread's worker context; in mode 2 this creates a cross-worker ownership transition. |
+| **Split bridge sequence** | Registration and the actual VLS operation are separate CGo crossings. Migration between them would make the pthread-local worker and lock state differ, so the wrapper pins across the whole sequence. |
+| **Worker lifetime mismatch** | A mode-2 worker follows M/pthread lifetime, while a session follows connection lifetime. Session affinity must not depend on whichever M happens to run the caller. |
+| **Unsupported direct native transition** | Calling VLS from a Frida callback does not automatically run Go's `runtime.cgocall` stack, scheduler, ABI, and pointer-lifetime protocol. This—not a proven fixed-address heap collision—is the memory-safety issue. |
+| **Cross-worker session access (mode 2)** | Two goroutines on different Ms can touch the same vlsh; VLS may trigger clone/share RPC paths. A mode-2 design instead needs stable session-to-owner dispatch. |
 | **`__thread` invisibility to Go** | Go has no concept of TLS-per-OS-thread. The runtime cannot help you; you must enforce thread affinity yourself. |
 
 **None of these are bugs in VCL.** VCL has an honest contract: *one pthread = one worker, lifetime-coherent, callable in serial unless the multi-thread modes are set up explicitly.* It is Go's M:N scheduler that violates this contract by default.
@@ -812,7 +818,17 @@ while parked on channels.
 
 ## 13. Earlier Attempts: Why Frida-Based Approaches Failed
 
-For historical context, two earlier sister projects tried other strategies. Both worked for one connection and failed for many.
+The source-audited companion
+[Frida Goroutine Tracking vs. VLS Thread Ownership](frida_goroutine_tracking_analysis.md)
+is the canonical analysis of goroutine identity, VLS pthread ownership, CGo
+stack transitions, and possible native Frida alternatives. It also corrects
+two historical simplifications below: the current VCL heap is kernel-placed,
+not fixed-address, and Frida serializes JavaScript entry/exit through its
+script lock while cooperative `NativeFunction` calls may overlap in native
+code.
+
+For historical context, two earlier sister projects tried other strategies.
+Both worked for one connection and failed for many.
 
 ### 13.0 At-a-glance capability matrix
 
@@ -844,7 +860,9 @@ For historical context, two earlier sister projects tried other strategies. Both
 * **Strategy:** Use Frida to JIT-overwrite Go's `syscall.socket`, `syscall.bind`, `syscall.connect`, `syscall.accept4`, etc. with `ret`-shims, then in `onLeave` callbacks call the corresponding LDP function (`ldp.socket(...)`, etc.).
 * **Worked:** Single-connection TCP echo, both client and server.
 * **Why it failed at scale:**
-    * Frida's JavaScript engine is **single-threaded**. All hooks serialise through one V8 isolate. With N goroutines doing I/O, you get O(N) tail latency.
+    * Hook callbacks contend on the script's JavaScript lock.
+      Dispatch is serialized there; cooperative native calls may overlap and
+      therefore need explicit VLS ownership and synchronization.
     * `accept4` had to spin-wait inside the hook (100% CPU), blocking every other hooked syscall.
     * Each hook used `epoll_wait` as an MQ pump → thundering herd.
     * Go's runtime poller was bypassed → hooks couldn't return `EAGAIN`, had to block inside.
@@ -857,7 +875,8 @@ For historical context, two earlier sister projects tried other strategies. Both
 * **Strategy:** Hook the single entry point `internal/runtime/syscall.Syscall6`. Dispatch by syscall number, replace `RAX` with `SYS_GETPID` (a harmless no-op) so the kernel doesn't act, then call `vls_*` directly in `onLeave` and write the result back to `RAX`/`RCX`.
 * **Worked:** Echo + HTTP, one connection at a time.
 * **Why it failed:**
-    * `clib_mem_init` (called by `vls_app_create`) conflicted with Go's stack allocator when goroutines were spawned afterwards → stack corruption.
+    * Direct `NativeFunction` calls bypassed Go's supported CGo
+      stack/scheduler/ABI transition while VLS state remained pthread-local.
     * Every syscall (not just network) paid 3-5 µs of interception cost — `futex`, `mmap`, `epoll_pwait` all dragged.
     * Only one connection in flight at any time.
     * Fixed iteration counts for polling were brittle (500×10ms here, 50×10ms there).
@@ -865,7 +884,10 @@ For historical context, two earlier sister projects tried other strategies. Both
 
 ### 13.3 The structural problem common to both
 
-> They emulate a kernel inside a single-threaded JS interpreter while pretending to Go that everything is synchronous. O(1) for one conn, O(N) tail latency for N, and never thread-safe.
+> They emulate kernel FD and readiness semantics from an injected hook while
+> VLS ownership remains pthread-local. Serializing at the JavaScript layer
+> limits throughput; allowing native calls to overlap without owner dispatch
+> breaks VLS's state model.
 
 ### 13.4 Why vclnet's CGo approach is structurally different
 
@@ -902,7 +924,10 @@ The following four tables are designed to drop straight into a slide deck. Each 
 | A9 | **`accept4` flags translation drift** | LDP's accept4 flag handling differs subtly from kernel | `SOCK_CLOEXEC` / `SOCK_NONBLOCK` propagation bugs |
 | A10 | **Single connection scales; many do not** | Items A1–A4 compound | Works for echo demos; collapses under any realistic load |
 
-**Bottom line on A:** Each hook is locally correct but globally serialised through Frida's single JS thread, and the fake-FD-via-LDP path leaks into the rest of Go's runtime in ways that cannot be plugged.
+**Bottom line on A:** JavaScript dispatch is serialized through Frida's script
+lock, and the fake-FD-via-LDP path leaks into the rest of Go's runtime.
+Releasing the script lock for native calls removes neither VLS ownership nor
+the fake-FD/netpoll mismatch.
 
 #### 13.5.2 Approach B — `go-frida-vpp` (single hook on `Syscall6` → VLS direct)
 
@@ -910,18 +935,22 @@ The following four tables are designed to drop straight into a slide deck. Each 
 
 | # | Issue | Mechanism | Consequence |
 | --- | --- | --- | --- |
-| B1 | **No goroutine support, period** | `vls_app_create` runs `clib_mem_init`; later goroutine stack growth collides with VPP's mheap baseva | Random SIGSEGV / corrupted goroutine stacks; only safe with `GOMAXPROCS=1` and zero extra goroutines |
+| B1 | **No supported Go-to-C transition** | Frida calls VLS without `runtime.cgocall` and its scheduler, system-stack, ABI, and pointer-lifetime protocol | Light-load success does not establish memory safety under stack growth, GC, callbacks, or blocking |
 | B2 | **Every syscall pays interception cost** | The hook fires on *all* `Syscall6` calls, not just network — `futex`, `mmap`, `nanosleep`, `epoll_pwait` all trampoline through JS | ~3–5 µs added to every syscall in the process |
 | B3 | **One connection at a time** | The hook is synchronous, inline; while it runs, no other syscall can complete | Server handles one conn, closes it, accepts the next |
 | B4 | **Hardcoded polling iteration counts** | Wait loops like `500 × 10ms` or `50 × 10ms` baked into hook | Misses fast events; over-waits slow ones; spurious timeouts |
 | B5 | **MPTCP probe still breaks** | `Syscall6` hook sees `SYS_SOCKET` but doesn't know about IPPROTO_MPTCP semantics | Same `EADDRINUSE` symptom as A8 |
-| B6 | **`clib_mem_init` allocator clash** | VPP installs its own allocator at fixed addresses during `vls_app_create` | Cannot safely call any Go function that grows the stack after Init |
+| B6 | **Wrong VLS execution identity** | A G may reach hooks on different pthreads, while VLS worker and lock state are pthread TLS | Direct or overlapping calls can use the wrong worker/session/MQ ownership |
 | B7 | **Direct register manipulation is ABI-fragile** | Hook reads/writes `RAX`/`RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9` directly from JS | Breaks on any Go runtime change to syscall calling convention |
 | B8 | **Cannot return EAGAIN to Go runtime** | If hook returned EAGAIN, Go's netpoller would try to register the (non-existent) FD with kernel epoll → EBADF | Hook must block inside `vls_epoll_wait` indefinitely |
 | B9 | **Frida JS GC pauses the hook** | V8's GC stalls the isolate; in-flight network operations stall too | Periodic latency spikes correlated with V8 GC |
-| B10 | **Cannot scale beyond `GOMAXPROCS=1`** | Items B1, B3, B6 jointly forbid multi-M operation | Throughput bounded by one core regardless of machine size |
+| B10 | **No owner-dispatch architecture** | The prototype had no stable session-to-worker route or native worker pool | Multi-M execution is unsafe; serializing it bounds throughput |
 
-**Bottom line on B:** Cleaner than A (one hook, no LDP, no fake FDs in the LDP sense), but the structural blocker is `clib_mem_init` + Go's stack allocator. You cannot run goroutines safely once VLS is initialised — and a Go program without goroutines isn't really a Go program.
+**Bottom line on B:** Cleaner than A (one hook and no LDP), but goroutine
+identification would not fix its unsupported Go/native transition,
+pthread-owned VLS state, or readiness integration. The current VCL heap uses a
+kernel-selected mapping, so a fixed-address collision is not the supported
+explanation.
 
 #### 13.5.3 Why **Frida** is not the right solution (architecturally)
 
@@ -929,7 +958,7 @@ Beyond the specific issues above, Frida itself is the wrong tool for this job. T
 
 | # | Reason | Detail |
 | --- | --- | --- |
-| 1 | **Wrong threading model** | Frida exposes one JS isolate per process. The networking workload we need to support is N concurrent goroutines × M cores. There is no Frida configuration that makes the isolate multi-threaded. |
+| 1 | **Wrong dispatch model** | JavaScript entry/exit is protected by the script lock. Cooperative native calls can overlap, but overlap is unsafe without session-to-worker ownership and dispatch. |
 | 2 | **Dynamic instrumentation overhead is paid forever** | Frida hooks live for the program's lifetime. Every covered call instruction goes through JIT trampoline → JS isolate → JS callback → trampoline back. There is no way to "compile out" the hook. |
 | 3 | **Adversarial to Go's runtime invariants** | Go's compiler / runtime assume `syscall.*` wrappers and `runtime·entersyscall` / `runtime·exitsyscall` have specific stack and register layouts. Frida overwrites those prologues. Any Go runtime change can break the hooks silently. |
 | 4 | **No path to integrate with `runtime.netpoll`** | Frida cannot synthesize a kernel FD whose readiness comes from VPP's MQ. Without that, hooks must block in-place, defeating the entire reason Go uses an M:N scheduler. |
@@ -971,9 +1000,13 @@ Beyond the specific issues above, Frida itself is the wrong tool for this job. T
 
 Two failures, simultaneously, both structural:
 
-#### (a) Frida's JS runtime is single-threaded
+#### (a) Frida has a serialized JavaScript dispatch boundary
 
-Frida's `Interceptor` callbacks all execute on Frida's V8 isolate, which has **one** execution context. With N goroutines hammering hooked syscalls, every hook serialises through that single JS thread. Worse, if any hook blocks (e.g. spin-waiting in `accept4`, or pumping the MQ in `epoll_pwait`), **every other hooked syscall in the process — including ones unrelated to networking — queues behind it**. Go's runtime cannot do useful work because its own internal syscalls (`futex`, `mmap`, `epoll_pwait`, etc.) go through the same chokepoint. Tail latency becomes O(N).
+`Interceptor` callbacks entering one Frida script contend on its JavaScript
+lock. A callback that busy-waits in JavaScript delays other callbacks. The
+default cooperative `NativeFunction` scheduling releases that lock during the
+native call, so native calls can overlap; without session-to-worker dispatch,
+that overlap exposes VLS's pthread ownership problem rather than solving it.
 
 #### (b) The Go runtime breaks Frida's caller assumptions
 
@@ -983,7 +1016,11 @@ Frida resolves `syscall.Syscall6` as a code address and rewrites its prologue. I
 * Go can synthesise new Ms when a goroutine blocks (`newm` / `handoffp`).
 * Some syscalls run *very* early in goroutine setup, before the runtime is willing to be intercepted.
 
-On top of that, `go-frida-vpp` had to call `vls_app_create` from inside the process, which runs `clib_mem_init`. That installs VPP's allocator state at fixed addresses, and if Go subsequently asks the kernel for a stack region that interferes with VPP's mheap, you get **corrupted goroutine stacks** and random panics.
+On top of that, `go-frida-vpp` called VLS through Frida rather than through
+Go's CGo transition. The Go runtime was not told about the foreign call, its
+possible blocking, or its pointer lifetimes. The inspected VPP source maps the
+VCL heap with `mmap(NULL, ...)`; a fixed-address collision must not be asserted
+without evidence from the exact binary and process maps.
 
 **Honest answer:** for one connection, mostly fine. For >1 concurrent goroutine doing I/O, you get non-deterministic latency spikes, EBADF storms from fake FDs leaking into non-hooked syscalls, and eventually stack/memory corruption. The approach is structurally O(N) at best and not safe under goroutine scheduling at all.
 
@@ -1253,7 +1290,11 @@ The three deep-dive questions are *the* questions for vclnet because they corres
 | **FD identity** | `net.Conn` deliberately hides the FD; runtime poller owns FDs | `vlsh` is not a kernel FD and must never be passed to kernel syscalls | `vlsh` lives only inside `internal/vclpoll`; `tcpConn` never exposes it; no Go FD leakage possible |
 | **Blocking semantics** | `net.Conn.Read` must park without consuming one M per connection | Blocking VLS would hold the calling pthread | Non-blocking calls plus selected readiness loops park callers on Go channels |
 
-The Frida attempts failed because they tried to *lie* to the Go runtime — claim a kernel FD that wasn't real, claim a syscall returned EAGAIN when the runtime poller couldn't process it, claim work was synchronous when really it queued on a single JS thread. Every lie eventually got called.
+The Frida attempts failed because they tried to *lie* to the Go runtime—claim
+a kernel FD that was not real, return readiness the runtime poller could not
+consume, and enter foreign VLS code without a supported Go/native transition.
+JavaScript dispatch serialization and unsafe overlapping native calls are two
+sides of the same missing owner-dispatch design.
 
 **vclnet doesn't lie.** It accepts that:
 

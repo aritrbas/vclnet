@@ -7,7 +7,10 @@ implementations whose data path uses VPP instead of the kernel network stack.
 The package replaces the earlier Frida syscall-interception prototypes. The
 architecture and migration rationale are documented in
 [docs/architecture.md](docs/architecture.md), with VPP internals in
-[docs/vclnet_deep_dive.md](docs/vclnet_deep_dive.md).
+[docs/vclnet_deep_dive.md](docs/vclnet_deep_dive.md). The source-audited
+analysis of VLS pthread ownership, Go goroutine memory, and the limits of a
+Frida goroutine shim is in
+[docs/frida_goroutine_tracking_analysis.md](docs/frida_goroutine_tracking_analysis.md).
 
 ## Current status
 
@@ -324,6 +327,8 @@ multi-worker stress.
 |-- test/run_*.sh                VPP test/demo runners
 |-- docs/architecture.md         design and Frida migration rationale
 |-- docs/vclnet_deep_dive.md     VPP/VCL/VLS internals
+|-- docs/frida_goroutine_tracking_analysis.md
+|                                Frida, goroutine, and VLS memory analysis
 |-- docs/adoption_guide.md       application integration guide
 |-- docs/executive_report.md     decision-maker summary
 `-- summary.md                  current status and canonical pending work
