@@ -481,6 +481,15 @@ var (
 	appLive    atomic.Bool
 
 	workerRegistry sync.Map // pthread id (uintptr) -> struct{}
+
+	// vlsMu serializes worker registration and app create/destroy against
+	// every other VLS call. libvppcom's vls_register_vcl_worker is empirically
+	// not safe against a concurrent vls_* call on another thread (it mutates
+	// the shared worker vec while vls_epoll_wait dereferences per-worker
+	// state, producing SIGSEGV inside libvppcom). Registration and lifecycle
+	// operations take the write lock (rare); every other VLS call takes the
+	// read lock (cheap, allows concurrency).
+	vlsMu sync.RWMutex
 )
 
 // AppInit performs the one-time VLS application registration (idempotent).
@@ -490,6 +499,9 @@ func AppInit(appName string) error {
 	appOnce.Do(func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
+
+		vlsMu.Lock()
+		defer vlsMu.Unlock()
 
 		cname := C.CString(appName)
 		defer C.free(unsafe.Pointer(cname))
@@ -506,22 +518,48 @@ func AppInit(appName string) error {
 }
 
 // registerThisThread ensures the current OS thread is registered as a VCL
-// worker. Must be called with runtime.LockOSThread() held.
+// worker. Must be called with runtime.LockOSThread() held. Registration is
+// serialized under vlsMu.Lock() so it cannot race a concurrent vls_* call
+// on another thread. Uses double-checked locking so the fast path (already
+// registered) is a single sync.Map load.
 func registerThisThread() {
 	tid := uintptr(C.vclpoll_pthread_self())
-	if _, ok := workerRegistry.Load(tid); !ok {
-		C.vclpoll_register_worker()
-		workerRegistry.Store(tid, struct{}{})
+	if _, ok := workerRegistry.Load(tid); ok {
+		return
 	}
+	vlsMu.Lock()
+	defer vlsMu.Unlock()
+	if _, ok := workerRegistry.Load(tid); ok {
+		return
+	}
+	C.vclpoll_register_worker()
+	workerRegistry.Store(tid, struct{}{})
 }
 
-// pin locks the calling goroutine to its current OS thread and ensures
-// that thread has been registered as a VCL worker. Callers MUST defer the
-// returned unpin function.
-func pin() func() {
+// enterVLS pins the calling goroutine to its current OS thread, registers
+// that thread as a VCL worker (if needed), and acquires the VLS shared read
+// lock. Must be paired with exitVLS(). The read lock lets many VLS calls
+// proceed concurrently while blocking only rare worker registrations and
+// app lifecycle operations.
+func enterVLS() {
 	runtime.LockOSThread()
 	registerThisThread()
-	return runtime.UnlockOSThread
+	vlsMu.RLock()
+}
+
+// exitVLS releases the VLS shared read lock and unpins the calling goroutine.
+func exitVLS() {
+	vlsMu.RUnlock()
+	runtime.UnlockOSThread()
+}
+
+// pin is a defer-friendly wrapper around enterVLS/exitVLS for one-shot VLS
+// calls. Callers MUST defer the returned unpin function:
+//
+//	defer pin()()
+func pin() func() {
+	enterVLS()
+	return exitVLS
 }
 
 // --- Shared poller bridge functions (used by poller.go) ---
@@ -532,9 +570,14 @@ type pollEvent struct {
 	Events uint32
 }
 
-// pollerEpollCreate creates a persistent vls_epoll handle.
+// pollerEpollCreate creates a persistent vls_epoll handle. The poller's OS
+// thread must already be registered (poller.loop() calls registerThisThread
+// before this). We take the shared read lock so this CGo call cannot race a
+// concurrent vls_register_vcl_worker on another thread.
 func pollerEpollCreate() (VLSH, error) {
+	vlsMu.RLock()
 	rv := C.vclpoll_epoll_create()
+	vlsMu.RUnlock()
 	if rv < 0 {
 		return invalidVLSH, vppErr("epoll_create", int(rv))
 	}
@@ -547,7 +590,9 @@ func pollerEpollCtlAdd(epVLSH, vlsh VLSH, events uint32) error {
 	C.memset(unsafe.Pointer(&ev), 0, C.sizeof_struct_epoll_event)
 	ev.events = C.uint32_t(events)
 	*(*C.uint64_t)(unsafe.Pointer(&ev.data[0])) = C.uint64_t(vlsh)
+	vlsMu.RLock()
 	rv := C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_ADD, C.int(vlsh), &ev)
+	vlsMu.RUnlock()
 	if rv < 0 {
 		return vppErr("epoll_ctl_add", int(rv))
 	}
@@ -560,7 +605,9 @@ func pollerEpollCtlMod(epVLSH, vlsh VLSH, events uint32) error {
 	C.memset(unsafe.Pointer(&ev), 0, C.sizeof_struct_epoll_event)
 	ev.events = C.uint32_t(events)
 	*(*C.uint64_t)(unsafe.Pointer(&ev.data[0])) = C.uint64_t(vlsh)
+	vlsMu.RLock()
 	rv := C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_MOD, C.int(vlsh), &ev)
+	vlsMu.RUnlock()
 	if rv < 0 {
 		return vppErr("epoll_ctl_mod", int(rv))
 	}
@@ -569,11 +616,16 @@ func pollerEpollCtlMod(epVLSH, vlsh VLSH, events uint32) error {
 
 // pollerEpollCtlDel removes a session from the poller's epoll instance.
 func pollerEpollCtlDel(epVLSH, vlsh VLSH) {
+	vlsMu.RLock()
 	C.vclpoll_epoll_ctl(C.int(epVLSH), C.EPOLL_CTL_DEL, C.int(vlsh), nil)
+	vlsMu.RUnlock()
 }
 
 // pollerEpollWait calls vls_epoll_wait on the poller's handle.
-// Returns the number of ready events written to buf.
+// Returns the number of ready events written to buf. The read lock is held
+// for the duration of the CGo call so vls_register_vcl_worker cannot mutate
+// VLS internal state under our feet. The 100ms timeout bounds how long a
+// waiting registrator has to sit behind us.
 func pollerEpollWait(epVLSH VLSH, buf []pollEvent) int {
 	if len(buf) == 0 {
 		return 0
@@ -583,7 +635,9 @@ func pollerEpollWait(epVLSH VLSH, buf []pollEvent) int {
 		maxEv = 64
 	}
 	var events [64]C.struct_epoll_event
+	vlsMu.RLock()
 	n := C.vclpoll_epoll_wait(C.int(epVLSH), &events[0], C.int(maxEv), 0.1)
+	vlsMu.RUnlock()
 	if n <= 0 {
 		return 0
 	}
@@ -657,19 +711,18 @@ func DialTCP4(ip4 [4]byte, port uint16) (VLSH, error) {
 // Accept blocks until a new connection arrives. Returns the new conn's VLSH
 // and the peer's IPv4 + port (host order).
 func Accept(listener VLSH) (VLSH, [4]byte, uint16, error) {
-	runtime.LockOSThread()
-	registerThisThread()
+	enterVLS()
 
 	for {
 		if !appLive.Load() {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return invalidVLSH, [4]byte{}, 0, ErrClosed
 		}
 		var peerIP4 C.uint32_t
 		var peerPort C.uint16_t
 		rv := C.vclpoll_accept_nb(C.int(listener), &peerIP4, &peerPort)
 		if rv >= 0 {
-			runtime.UnlockOSThread()
+			exitVLS()
 			be := uint32(peerIP4)
 			ip := [4]byte{byte(be), byte(be >> 8), byte(be >> 16), byte(be >> 24)}
 			pBE := uint16(peerPort)
@@ -677,13 +730,12 @@ func Accept(listener VLSH) (VLSH, [4]byte, uint16, error) {
 			return VLSH(rv), ip, port, nil
 		}
 		if !isAgain(int(rv)) {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return invalidVLSH, [4]byte{}, 0, vppErr("accept", int(rv))
 		}
-		runtime.UnlockOSThread()
+		exitVLS()
 		pollWait(listener, epollIn)
-		runtime.LockOSThread()
-		registerThisThread()
+		enterVLS()
 	}
 }
 
@@ -697,29 +749,27 @@ func ReadContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	runtime.LockOSThread()
-	registerThisThread()
+	enterVLS()
 
 	for {
 		if !appLive.Load() {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, ErrClosed
 		}
 		rv := C.vclpoll_read(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
 		if rv >= 0 {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return int(rv), nil
 		}
 		if !isAgain(int(rv)) {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, vppErr("read", int(rv))
 		}
-		runtime.UnlockOSThread()
+		exitVLS()
 		if !PollWaitContext(vlsh, epollIn, doneCh) {
 			return 0, ErrWaitCanceled
 		}
-		runtime.LockOSThread()
-		registerThisThread()
+		enterVLS()
 	}
 }
 
@@ -733,29 +783,27 @@ func WriteContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	runtime.LockOSThread()
-	registerThisThread()
+	enterVLS()
 
 	for {
 		if !appLive.Load() {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, ErrClosed
 		}
 		rv := C.vclpoll_write(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)))
 		if rv >= 0 {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return int(rv), nil
 		}
 		if !isAgain(int(rv)) {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, vppErr("write", int(rv))
 		}
-		runtime.UnlockOSThread()
+		exitVLS()
 		if !PollWaitContext(vlsh, epollOut, doneCh) {
 			return 0, ErrWaitCanceled
 		}
-		runtime.LockOSThread()
-		registerThisThread()
+		enterVLS()
 	}
 }
 
@@ -874,12 +922,11 @@ type AddrInfo struct {
 
 // AcceptFull blocks until a new connection arrives, returning full address info.
 func AcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
-	runtime.LockOSThread()
-	registerThisThread()
+	enterVLS()
 
 	for {
 		if !appLive.Load() {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return invalidVLSH, AddrInfo{}, ErrClosed
 		}
 		var peerIP [16]C.uint8_t
@@ -887,7 +934,7 @@ func AcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
 		var isIP4 C.int
 		rv := C.vclpoll_accept_nb_full(C.int(listener), &peerIP[0], &peerPort, &isIP4)
 		if rv >= 0 {
-			runtime.UnlockOSThread()
+			exitVLS()
 			var info AddrInfo
 			for i := 0; i < 16; i++ {
 				info.IP[i] = byte(peerIP[i])
@@ -898,25 +945,23 @@ func AcceptFull(listener VLSH) (VLSH, AddrInfo, error) {
 			return VLSH(rv), info, nil
 		}
 		if !isAgain(int(rv)) {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return invalidVLSH, AddrInfo{}, vppErr("accept", int(rv))
 		}
-		runtime.UnlockOSThread()
+		exitVLS()
 		pollWait(listener, epollIn)
-		runtime.LockOSThread()
-		registerThisThread()
+		enterVLS()
 	}
 }
 
 // AcceptFullContext is like AcceptFull but respects context cancellation.
 // Returns ErrClosed if doneCh is closed before a connection arrives.
 func AcceptFullContext(listener VLSH, doneCh <-chan struct{}) (VLSH, AddrInfo, error) {
-	runtime.LockOSThread()
-	registerThisThread()
+	enterVLS()
 
 	for {
 		if !appLive.Load() {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return invalidVLSH, AddrInfo{}, ErrClosed
 		}
 		var peerIP [16]C.uint8_t
@@ -924,7 +969,7 @@ func AcceptFullContext(listener VLSH, doneCh <-chan struct{}) (VLSH, AddrInfo, e
 		var isIP4 C.int
 		rv := C.vclpoll_accept_nb_full(C.int(listener), &peerIP[0], &peerPort, &isIP4)
 		if rv >= 0 {
-			runtime.UnlockOSThread()
+			exitVLS()
 			var info AddrInfo
 			for i := 0; i < 16; i++ {
 				info.IP[i] = byte(peerIP[i])
@@ -935,15 +980,14 @@ func AcceptFullContext(listener VLSH, doneCh <-chan struct{}) (VLSH, AddrInfo, e
 			return VLSH(rv), info, nil
 		}
 		if !isAgain(int(rv)) {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return invalidVLSH, AddrInfo{}, vppErr("accept", int(rv))
 		}
-		runtime.UnlockOSThread()
+		exitVLS()
 		if !PollWaitContext(listener, epollIn, doneCh) {
 			return invalidVLSH, AddrInfo{}, ErrClosed
 		}
-		runtime.LockOSThread()
-		registerThisThread()
+		enterVLS()
 	}
 }
 
@@ -954,11 +998,17 @@ func BeginShutdown() {
 }
 
 // AppDestroy performs VLS application teardown when AppInit succeeded.
+// Takes vlsMu.Lock() (not RLock) because vppcom_app_destroy tears down the
+// shared VCL/VLS state and must be exclusive against every other VLS call.
 func AppDestroy() {
 	if !appCreated.CompareAndSwap(true, false) {
 		return
 	}
-	defer pin()()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	registerThisThread()
+	vlsMu.Lock()
+	defer vlsMu.Unlock()
 	C.vclpoll_app_destroy()
 }
 
@@ -1142,8 +1192,7 @@ func SendToContext(vlsh VLSH, p []byte, addr AddrInfo, doneCh <-chan struct{}) (
 	if len(p) == 0 {
 		return 0, nil
 	}
-	runtime.LockOSThread()
-	registerThisThread()
+	enterVLS()
 
 	var ip [16]byte
 	copy(ip[:], addr.IP[:])
@@ -1154,25 +1203,24 @@ func SendToContext(vlsh VLSH, p []byte, addr AddrInfo, doneCh <-chan struct{}) (
 
 	for {
 		if !appLive.Load() {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, ErrClosed
 		}
 		rv := C.vclpoll_sendto(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)),
 			C.int(isIP4), (*C.uint8_t)(&ip[0]), C.uint16_t(portBE(addr.Port)))
 		if rv >= 0 {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return int(rv), nil
 		}
 		if !isAgain(int(rv)) {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, vppErr("sendto", int(rv))
 		}
-		runtime.UnlockOSThread()
+		exitVLS()
 		if !PollWaitContext(vlsh, epollOut, doneCh) {
 			return 0, ErrWaitCanceled
 		}
-		runtime.LockOSThread()
-		registerThisThread()
+		enterVLS()
 	}
 }
 
@@ -1186,12 +1234,11 @@ func RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo
 	if len(p) == 0 {
 		return 0, AddrInfo{}, nil
 	}
-	runtime.LockOSThread()
-	registerThisThread()
+	enterVLS()
 
 	for {
 		if !appLive.Load() {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, AddrInfo{}, ErrClosed
 		}
 		var peerIP [16]C.uint8_t
@@ -1200,7 +1247,7 @@ func RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo
 		rv := C.vclpoll_recvfrom(C.int(vlsh), unsafe.Pointer(&p[0]), C.size_t(len(p)),
 			&peerIP[0], &peerPort, &isIP4)
 		if rv >= 0 {
-			runtime.UnlockOSThread()
+			exitVLS()
 			var info AddrInfo
 			for i := 0; i < 16; i++ {
 				info.IP[i] = byte(peerIP[i])
@@ -1211,15 +1258,14 @@ func RecvFromContext(vlsh VLSH, p []byte, doneCh <-chan struct{}) (int, AddrInfo
 			return int(rv), info, nil
 		}
 		if !isAgain(int(rv)) {
-			runtime.UnlockOSThread()
+			exitVLS()
 			return 0, AddrInfo{}, vppErr("recvfrom", int(rv))
 		}
-		runtime.UnlockOSThread()
+		exitVLS()
 		if !PollWaitContext(vlsh, epollIn, doneCh) {
 			return 0, AddrInfo{}, ErrWaitCanceled
 		}
-		runtime.LockOSThread()
-		registerThisThread()
+		enterVLS()
 	}
 }
 
