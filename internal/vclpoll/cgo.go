@@ -63,10 +63,16 @@ static void vclpoll_session_worker(int vlsh, uint32_t *session_index,
 }
 
 // Create a non-blocking TCP listener bound to the given IPv4+port (BE).
+// SO_REUSEPORT is enabled so that multiple workers can each own a listener
+// on the same endpoint (sharded accept).
 static int vclpoll_listen_tcp4_nb(uint32_t ip4_be, uint16_t port_be,
                                   int backlog) {
     vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
     if (vlsh < 0) return vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
 
     uint8_t ip[4];
     memcpy(ip, &ip4_be, 4);
@@ -201,13 +207,17 @@ static int vclpoll_set_ckpair(int vlsh, uint32_t ckp_index) {
 
 // Create a non-blocking TLS listener bound to IPv4 addr:port with the given
 // cert/key index. The full sequence is
-//   vls_create(PROTO_TLS)  ->  vls_attr(SET_CKPAIR)  ->  vls_bind  ->  vls_listen
+//   vls_create(PROTO_TLS)  ->  vls_attr(SET_REUSEPORT)  ->  vls_attr(SET_CKPAIR)  ->  vls_bind  ->  vls_listen
 // and any failure closes the vlsh before returning the errno. This matches
 // vperf's server-side TLS setup.
 static int vclpoll_listen_tls4_nb(uint32_t ip4_be, uint16_t port_be,
                                   int backlog, uint32_t ckp_index) {
     vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
     if (vlsh < 0) return (int)vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
 
     uint32_t ckp_len = sizeof(ckp_index);
     int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
@@ -236,6 +246,10 @@ static int vclpoll_listen_tls6_nb(const uint8_t ip6[16], uint16_t port_be,
                                   int backlog, uint32_t ckp_index) {
     vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TLS, 1);
     if (vlsh < 0) return (int)vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
 
     uint32_t ckp_len = sizeof(ckp_index);
     int rv = vls_attr(vlsh, VPPCOM_ATTR_SET_CKPAIR, &ckp_index, &ckp_len);
@@ -352,6 +366,10 @@ static int vclpoll_listen_tcp6_nb(const uint8_t ip6[16], uint16_t port_be,
                                   int backlog) {
     vls_handle_t vlsh = vls_create(VPPCOM_PROTO_TCP, 1);
     if (vlsh < 0) return vlsh;
+
+    uint8_t reuse = 1;
+    uint32_t reuse_len = sizeof(reuse);
+    vls_attr(vlsh, VPPCOM_ATTR_SET_REUSEPORT, &reuse, &reuse_len);
 
     uint8_t ip[16];
     memcpy(ip, ip6, 16);

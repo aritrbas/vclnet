@@ -241,11 +241,11 @@ func (d *mode2Dispatcher) createConnect(fn func() (VLSH, bool, error)) (VLSH, bo
 }
 
 func (d *mode2Dispatcher) listenTCP4(ip [4]byte, port uint16, backlog int) (VLSH, error) {
-	return d.create(func() (VLSH, error) { return mode3ListenTCP4(ip, port, backlog) })
+	return d.newShardedListener(func() (VLSH, error) { return mode3ListenTCP4(ip, port, backlog) })
 }
 
 func (d *mode2Dispatcher) listenTCP6(ip [16]byte, port uint16, backlog int) (VLSH, error) {
-	return d.create(func() (VLSH, error) { return mode3ListenTCP6(ip, port, backlog) })
+	return d.newShardedListener(func() (VLSH, error) { return mode3ListenTCP6(ip, port, backlog) })
 }
 
 func (d *mode2Dispatcher) connectTCP4Start(ip [4]byte, port uint16) (VLSH, bool, error) {
@@ -280,11 +280,11 @@ func (d *mode2Dispatcher) delCertKeyPair(idx uint32) error {
 }
 
 func (d *mode2Dispatcher) listenTLS4(ip [4]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
-	return d.create(func() (VLSH, error) { return rawListenTLS4(ip, port, backlog, ckp) })
+	return d.newShardedListener(func() (VLSH, error) { return rawListenTLS4(ip, port, backlog, ckp) })
 }
 
 func (d *mode2Dispatcher) listenTLS6(ip [16]byte, port uint16, backlog int, ckp uint32) (VLSH, error) {
-	return d.create(func() (VLSH, error) { return rawListenTLS6(ip, port, backlog, ckp) })
+	return d.newShardedListener(func() (VLSH, error) { return rawListenTLS6(ip, port, backlog, ckp) })
 }
 
 func (d *mode2Dispatcher) connectTLS4Start(ip [4]byte, port uint16, ckp uint32, ckpValid bool) (VLSH, bool, error) {
@@ -338,6 +338,10 @@ func (d *mode2Dispatcher) acceptFull(listener VLSH) (VLSH, AddrInfo, error) {
 }
 
 func (d *mode2Dispatcher) acceptFullContext(listener VLSH, done <-chan struct{}) (VLSH, AddrInfo, error) {
+	if sl := d.lookupShardedListener(listener); sl != nil {
+		return d.shardedAcceptFullContext(sl, done)
+	}
+
 	for {
 		ref, err := d.lookup(listener)
 		if err != nil {
@@ -423,6 +427,10 @@ func (d *mode2Dispatcher) shutdown(handle VLSH, how int) error {
 }
 
 func (d *mode2Dispatcher) close(handle VLSH) error {
+	if sl := d.lookupShardedListener(handle); sl != nil {
+		return d.closeShardedListener(sl)
+	}
+
 	ref, err := d.lookup(handle)
 	if err != nil {
 		return err
@@ -443,6 +451,17 @@ func (d *mode2Dispatcher) close(handle VLSH) error {
 func (d *mode2Dispatcher) closeVLSH(handle VLSH) { _ = d.close(handle) }
 
 func (d *mode2Dispatcher) getLocalAddr(handle VLSH) (AddrInfo, error) {
+	if sl := d.lookupShardedListener(handle); sl != nil {
+		// All shards bind to the same address; query the first one.
+		value, err := d.submit(sl.shards[0].worker, func(_ *worker) (any, error) {
+			return mode3GetLocalAddr(sl.shards[0].raw)
+		})
+		if err != nil {
+			return AddrInfo{}, err
+		}
+		return value.(AddrInfo), nil
+	}
+
 	value, err := d.sessionCall(handle, func(_ *worker, raw VLSH) (any, error) {
 		return mode3GetLocalAddr(raw)
 	})
@@ -463,6 +482,17 @@ func (d *mode2Dispatcher) getPeerAddr(handle VLSH) (AddrInfo, error) {
 }
 
 func (d *mode2Dispatcher) setV6Only(handle VLSH, value bool) error {
+	if sl := d.lookupShardedListener(handle); sl != nil {
+		for _, shard := range sl.shards {
+			_, err := d.submit(shard.worker, func(_ *worker) (any, error) {
+				return nil, mode3SetV6Only(shard.raw, value)
+			})
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	_, err := d.sessionCall(handle, func(_ *worker, raw VLSH) (any, error) {
 		return nil, mode3SetV6Only(raw, value)
 	})

@@ -33,8 +33,10 @@ This repository should still be treated as pre-production infrastructure:
   connected UDP can crash VPP during cut-through cleanup, so Mode 2 rejects
   every UDP entry point with an error wrapping `EOPNOTSUPP` before allocating
   VLS state. Use Mode 3 for UDP.
-- Mode 2 listeners use the correct single-owner v1 design. Per-worker listener
-  sharding and accept fan-in remain pending for maximum accept throughput.
+- Mode 2 listeners use per-worker sharding: one VLS listener per worker on the
+  same address:port (`SO_REUSEPORT`), with per-worker accept loops fanning into
+  a shared channel. This distributes accept load across all workers without
+  cross-worker VLS access.
 - Benchmarks exist, but the repository does not contain a reproducible
   kernel-vs-VPP baseline. Treat performance claims as hypotheses until measured
   on the target hardware and topology.
@@ -409,6 +411,7 @@ multi-worker stress.
 |   |-- poller.go                Mode 3 shared readiness poller
 |   |-- mode2.go                 ownership and session-affine routing
 |   |-- worker.go                pinned Mode 2 worker and per-worker epoll
+|   |-- shard_listener.go       per-worker listener sharding and accept fan-in
 |   `-- *_test.go                helper, worker, and VPP integration tests
 |-- pkgconfig/vppcom.pc.in       template for VPP discovery (see Build)
 |-- examples/                    echo, HTTP, and concurrency examples
@@ -432,8 +435,7 @@ multi-worker stress.
   `app-scope-local`, `transport_half_close` is a no-op for the CT protocol.
   Half-close works correctly over the full TCP transport.
 - Mode 3 remains the default. Mode 2 is opt-in, requires
-  `multi-thread-workers`, permanently pins one OS thread per worker, and uses a
-  single owner worker per listener until listener sharding is implemented.
+  `multi-thread-workers`, and permanently pins one OS thread per worker.
 - Listener port zero is rejected because the validated VCL build does not assign
   an ephemeral port.
 - The test scripts target the local VPP source/build layout and use Linux VLS

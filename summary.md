@@ -23,7 +23,7 @@ VCL worker.
 | Native VCL TLS | `DialTLS` / `ListenTLS` route TLS termination into VPP via `VPPCOM_PROTO_TLS` (OpenSSL engine, `vppcom_add_cert_key_pair` + `SET_CKPAIR`). No `crypto/tls` on the caller side | Unit config + VPP integration (echo, 128 KiB fragmentation, layered/native parity) |
 | Shutdown | Idempotent, wakes parked operations, stops VLS workers, and rejects later operations | Unit and subprocess VPP integration |
 | VLS Mode 3 | Shared VCL worker with one persistent readiness poller | Default; standard and multi-VPP-worker harnesses |
-| VLS Mode 2 | N pinned VCL workers, per-worker epoll, virtual process-wide handles, ownership preflight, and no shared poller; TCP only for the pinned VPP build | Opt-in; unit tests and multi-worker TCP, IPv6, HTTP, ownership, and UDP-rejection stress |
+| VLS Mode 2 | N pinned VCL workers, per-worker epoll, virtual process-wide handles, ownership preflight, per-worker sharded listeners with accept fan-in, and no shared poller; TCP only for the pinned VPP build | Opt-in; unit tests and multi-worker TCP, IPv6, HTTP, sharded-accept scaling, ownership, and UDP-rejection stress |
 
 DNS remains on the host resolver. VLS handles remain internal and are never
 passed to the Go runtime poller.
@@ -49,9 +49,11 @@ wrapping `EOPNOTSUPP` before any VLS datagram session is created.
 
 The Mode 2 concurrency core has explicit, testable invariants: workers remain
 pinned for their lifetime, raw VLS handles never cross owners, process-wide
-virtual handles disambiguate worker-local indexes, and each worker owns its
-readiness state. The current four-worker VPP harness passes TCP, IPv6, HTTP,
-large-payload, ownership, UDP-rejection, VPP-liveness, and process-exit checks.
+virtual handles disambiguate worker-local indexes, listeners are sharded across
+all workers with per-worker accept loops, and each worker owns its readiness
+state. The current four-worker VPP harness passes TCP, IPv6, HTTP,
+large-payload, sharded-accept scaling, ownership, UDP-rejection, VPP-liveness,
+and process-exit checks.
 
 That evidence does **not** make Mode 2 production-stable yet. Two compatibility
 gaps remain release blockers:
@@ -68,7 +70,7 @@ gaps remain release blockers:
 
 ## 2. Test inventory
 
-The repository currently has 152 top-level no-VPP tests:
+The repository currently has 159 top-level no-VPP tests:
 
 - 129 public-package contract and unit tests (including native VCL TLS
   contract tests covering server-side cert requirement, client-side
@@ -77,6 +79,8 @@ The repository currently has 152 top-level no-VPP tests:
   ckpair dedup, and big-endian length prefixing);
 - 9 shared Mode 3 poller tests;
 - 11 Mode 2 worker, ownership, parking, UDP rejection, and shutdown tests;
+- 7 sharded listener tests (per-worker creation, accept fan-in, context
+  cancellation, close/drain, lookup disambiguation, and blocking semantics);
 - 3 byte-order and errno helper tests.
 
 VPP-backed coverage currently has:
@@ -87,8 +91,8 @@ VPP-backed coverage currently has:
 - 2 deliberately skipped tests (unconnected-UDP `PacketConn` and
   half-close over cut-through transport);
 - 2 low-level vclpoll echo tests;
-- 5 multi-worker stress tests plus 2 Mode 2 ownership and UDP-rejection
-  invariant tests;
+- 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
+  ownership and UDP-rejection invariant tests;
 - 2 opt-in benchmarks.
 
 The standard harness exercises TCP IPv4 and IPv6, connected UDP IPv4 and IPv6,
@@ -126,7 +130,7 @@ maintaining independent roadmaps.
 | P0 | Resolve the Mode 2 UDP cleanup crash | Produce a minimal VPP reproducer, report or fix the stale cut-through TX event upstream, and enable Mode 2 UDP only on a verified-safe VPP build; retain fail-fast `EOPNOTSUPP` and VPP-liveness regressions until then |
 | P0 | Replace Mode 2 thread-retirement polling | Remove `/proc/self/task` polling and the process-main-thread exception; use an explicit worker terminal state or supported unregister/join mechanism, prove no VLS call or TLS destructor can race `vppcom_app_destroy`, and pass repeated shutdown stress |
 | P0 | Complete Mode 2 rollout validation | Run the full supported TCP integration surface, repeated shutdown cases, a long concurrency soak, and no-migration and safe-UDP-rejection assertions in CI; keep Mode 3 as default until the sustained-green and performance gates pass |
-| P1 | Shard Mode 2 listeners | Replace the correct but single-owner v1 listener path with one listener per worker and an accept fan-in; demonstrate accept scaling without cross-worker VLS access |
+| ~~P1~~ | ~~Shard Mode 2 listeners~~ | ~~Done. Per-worker listener sharding with SO_REUSEPORT and accept fan-in; validated with 16-connection sharded-accept integration test~~ |
 | P1 | Decide the unconnected UDP contract | Implement a per-peer session adapter with correct concurrent `PacketConn` behavior, or remove or deprecate `ListenPacket`; enable the skipped integration test |
 | P1 | Verify asynchronous connect completion errors | Replace the EPOLLOUT-implies-success assumption when VPP exposes a reliable session error query, and add refused and unreachable integration cases |
 | P1 | Establish reproducible performance baselines | Record topology, hardware, VPP and kernel configs, payload and concurrency distributions, raw benchmark output, and comparisons before publishing speedup claims |
@@ -146,9 +150,9 @@ maintaining independent roadmaps.
    `EOPNOTSUPP`; use Mode 3 for connected UDP.
 3. **Mode 3 is still the default.** It is the broadest-tested compatibility
    path, but application-side VLS work serializes on one shared worker.
-4. **Mode 2 is opt-in.** It requires `multi-thread-workers`, permanently pins
-   one OS thread per requested worker, and currently keeps each listener on one
-   owner worker. Listener sharding is pending.
+4. **Mode 2 is opt-in.** It requires `multi-thread-workers` and permanently pins
+   one OS thread per requested worker. Listeners are sharded across all workers
+   with per-worker accept loops and a fan-in channel.
 5. **Mode 2 uses virtual handles internally.** Raw VLS handles are worker-local
    pool indexes and can collide, so vclpoll maps process-unique handles to an
    owning worker and raw handle. They never escape the internal package.
@@ -195,6 +199,7 @@ internal/vclpoll dispatcher
           |-- N lifetime-pinned worker goroutines
           |-- process handle -> {owner worker, raw VLS handle}
           |-- one VLS epoll and exact waiter set per worker
+          |-- per-worker sharded listeners with accept fan-in
           |-- all admitted TCP operations run on the owner
           `-- UDP rejected before VLS allocation with EOPNOTSUPP
     |
@@ -220,7 +225,7 @@ VLS can enter its migration or clone path.
 | Session routing | Any registered thread under shared-mode locks | Every operation submitted to the owner |
 | Readiness | One shared epoll poller | One epoll and wait set per worker |
 | Application-side parallelism | Serialized | Parallel across owner workers |
-| Listener behavior | Shared-mode listener | Correct single-owner v1 listener |
+| Listener behavior | Shared-mode listener | Per-worker sharded listeners with SO_REUSEPORT and accept fan-in |
 | Protocol surface | TCP and connected UDP | TCP; UDP fails safely with `EOPNOTSUPP` |
 | Configuration | No `multi-thread-workers` token | Requires `multi-thread-workers` |
 | Status | Default and broadly tested | Experimental, opt-in, rollout validation pending |

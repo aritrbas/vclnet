@@ -1254,6 +1254,73 @@ func TestMultiWorkerMode2NoMigration(t *testing.T) {
 	}
 }
 
+// TestMultiWorkerMode2ShardedAccept verifies that the sharded listener
+// distributes accept work across all workers without cross-worker VLS access.
+// It opens many connections concurrently and checks that accept scaling works
+// (all connections are served) with zero ownership violations.
+func TestMultiWorkerMode2ShardedAccept(t *testing.T) {
+	skipIfNotMultiWorker(t)
+	if os.Getenv("VCLNET_VLS_MODE") != "2" {
+		t.Skip("sharded listener test only applies to VLS mode 2")
+	}
+
+	const nConns = 16
+	cmd, port, stderr := startServer(t, "echo", nConns)
+	defer cmd.Process.Kill()
+
+	if err := vclnet.Init("vclnet-test-client"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if got := vclpoll.CurrentMode(); got != vclpoll.Mode2 {
+		t.Fatalf("current VLS mode=%d, want mode 2", got)
+	}
+
+	type result struct {
+		idx int
+		err error
+	}
+	results := make(chan result, nConns)
+
+	for i := 0; i < nConns; i++ {
+		go func(idx int) {
+			conn, err := vclnet.Dial("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+			if err != nil {
+				results <- result{idx, err}
+				return
+			}
+			defer conn.Close()
+
+			msg := []byte(fmt.Sprintf("shard-accept-test-%d", idx))
+			if _, err := conn.Write(msg); err != nil {
+				results <- result{idx, fmt.Errorf("write: %w", err)}
+				return
+			}
+			got := make([]byte, len(msg))
+			if _, err := io.ReadFull(conn, got); err != nil {
+				results <- result{idx, fmt.Errorf("read: %w", err)}
+				return
+			}
+			if !bytes.Equal(got, msg) {
+				results <- result{idx, fmt.Errorf("mismatch: got %q want %q", got, msg)}
+				return
+			}
+			results <- result{idx, nil}
+		}(i)
+	}
+
+	for i := 0; i < nConns; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("goroutine %d: %v\nstderr:\n%s", r.idx, r.err, stderr.String())
+		}
+	}
+
+	if got := vclpoll.Mode2OwnershipViolations(); got != 0 {
+		t.Fatalf("mode-2 ownership violations=%d after sharded accept", got)
+	}
+	waitOrKill(t, cmd, stderr)
+}
+
 func TestMultiWorkerMode2UDPUnsupported(t *testing.T) {
 	skipIfNotMultiWorker(t)
 	if os.Getenv("VCLNET_VLS_MODE") != "2" {

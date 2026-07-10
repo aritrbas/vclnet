@@ -334,6 +334,77 @@ func (w *worker) dropWaitSet(public, raw VLSH, set *waitSet) {
 	wakeWaitSet(set)
 }
 
+// addWaiterRaw registers a waiter keyed by a raw VLSH that is NOT tracked as
+// a virtual-handle session (used by sharded listener accept loops). We store
+// the raw handle in the sessions map under a negative-space key so that
+// handleEvent's epoll cleanup path works correctly.
+func (w *worker) addWaiterRaw(raw VLSH, wtr *waiter) error {
+	key := ^raw // negative-space key to avoid collision with virtual handles
+	w.sessions[key] = raw
+	set, exists := w.waiters[key]
+	if !exists {
+		if err := w.add(w.epVLSH, raw, key, wtr.events); err != nil {
+			return err
+		}
+		w.waiters[key] = &waitSet{
+			waiters: map[*waiter]struct{}{wtr: {}},
+			events:  wtr.events,
+		}
+		return nil
+	}
+
+	newEvents := set.events | wtr.events
+	if newEvents != set.events {
+		if err := w.mod(w.epVLSH, raw, key, newEvents); err != nil {
+			return err
+		}
+	}
+	set.waiters[wtr] = struct{}{}
+	set.events = newEvents
+	return nil
+}
+
+// cancelWaiterRaw cancels a waiter previously registered via addWaiterRaw.
+func (w *worker) cancelWaiterRaw(raw VLSH, wtr *waiter) {
+	key := ^raw
+	set, ok := w.waiters[key]
+	if !ok {
+		return
+	}
+	if _, ok := set.waiters[wtr]; !ok {
+		return
+	}
+
+	oldEvents := set.events
+	delete(set.waiters, wtr)
+	wakeWaiter(wtr)
+	if len(set.waiters) == 0 {
+		w.del(w.epVLSH, raw)
+		delete(w.waiters, key)
+		delete(w.sessions, key)
+		return
+	}
+
+	set.events = combinedEvents(set)
+	if set.events != oldEvents {
+		if err := w.mod(w.epVLSH, raw, key, set.events); err != nil {
+			w.dropWaitSet(key, raw, set)
+		}
+	}
+}
+
+// removeWaitersRaw removes all waiters for a raw listener handle and cleans
+// up the sessions mapping installed by addWaiterRaw.
+func (w *worker) removeWaitersRaw(raw VLSH) {
+	key := ^raw
+	if set, ok := w.waiters[key]; ok {
+		w.del(w.epVLSH, raw)
+		delete(w.waiters, key)
+		wakeWaitSet(set)
+	}
+	delete(w.sessions, key)
+}
+
 func (w *worker) add(ep, raw, key VLSH, events uint32) error {
 	if w.epollAdd != nil {
 		return w.epollAdd(ep, raw, key, events)

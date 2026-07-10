@@ -79,11 +79,12 @@ repository has completed every production-hardening item.
 +-------------------------------v-------------------------------+
 | internal/vclpoll                                              |
 |                                                               |
-| dispatch.go     stable API and selected threading dispatcher   |
-| cgo.go          VLS bridge and one-shot helpers                 |
-| poller.go       Mode 3 shared VLS epoll owner                   |
-| mode2.go        virtual handles and session ownership routing   |
-| worker.go       pinned Mode 2 workers and per-worker epoll      |
+| dispatch.go          stable API and selected threading dispatcher   |
+| cgo.go               VLS bridge and one-shot helpers                |
+| poller.go            Mode 3 shared VLS epoll owner                  |
+| mode2.go             virtual handles and session ownership routing  |
+| worker.go            pinned Mode 2 workers and per-worker epoll     |
+| shard_listener.go    per-worker listener sharding and accept fan-in |
 +-------------------------------+-------------------------------+
                                 |
 +-------------------------------v-------------------------------+
@@ -172,6 +173,27 @@ supported switch and initialization verifies it with `vls_mt_wrk_supported`.
 Only TCP sessions are admitted in Mode 2 on this build. Every Mode 2 UDP entry
 point returns an error wrapping `EOPNOTSUPP` before a VLS session is allocated;
 see the cleanup-race analysis in the deep-dive document.
+
+#### Sharded listeners
+
+Mode 2 listeners use per-worker sharding. `Listen` and `ListenTLS` create one
+VLS listener per worker on the same address:port (via `SO_REUSEPORT` /
+`VPPCOM_ATTR_SET_REUSEPORT`). Each worker runs its own accept loop against its
+local listener handle, and accepted connections fan into a single buffered
+channel. The public `AcceptContext` reads from this channel, so accept load
+distributes across all workers without cross-worker VLS access.
+
+```text
+Worker 0: listen(addr) -> accept loop -> \
+Worker 1: listen(addr) -> accept loop -> --> fan-in channel --> AcceptContext
+Worker 2: listen(addr) -> accept loop -> /
+Worker 3: listen(addr) -> accept loop -> /
+```
+
+This design ensures every VLS operation (listen, accept, and subsequent I/O on
+accepted connections) stays on its owning worker's pinned OS thread. The
+per-worker epoll drives readiness for both listener and data sessions on that
+worker.
 
 ## 6. Non-blocking readiness
 
@@ -321,9 +343,11 @@ every session operation to its owner. The shared Mode 3 poller is never started
 in this path. This path currently admits TCP sessions only; UDP fails before
 VLS allocation with an error wrapping `EOPNOTSUPP`.
 
-The current v1 listener design assigns each listener to one owner. Accepted
-sessions inherit that owner. A later listener-sharding phase will create one
-listener per worker and fan accepts into the public listener.
+Listeners use per-worker sharding: each `Listen` or `ListenTLS` call creates
+one VLS listener per worker on the same address:port using `SO_REUSEPORT`,
+runs a per-worker accept loop, and fans accepted connections into a shared
+channel. This distributes accept load across all workers without cross-worker
+VLS access.
 
 `cpu { workers N }` configures VPP-side workers and is independent of VLS mode.
 The multi-worker harness accepts `--mode 3` and `--mode 2` to validate both
@@ -357,8 +381,9 @@ The standard harness uses separate server subprocesses because the tested VCL
 configuration cannot connect an app back to its own listener. It restarts VPP
 before the low-level poll tests to isolate session state.
 
-The Mode 2 multi-worker run includes five TCP stress tests plus ownership and
-safe-UDP-rejection invariants, followed by a VPP liveness probe.
+The Mode 2 multi-worker run includes five TCP stress tests, a sharded-accept
+scaling test, ownership and safe-UDP-rejection invariants, followed by a VPP
+liveness probe.
 
 See [../summary.md](../summary.md#2-test-inventory) for current counts and
 [../summary.md](../summary.md#3-pending-work) for open work.
