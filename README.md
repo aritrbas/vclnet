@@ -22,9 +22,11 @@ shutdown, and VPP configurations with multiple worker threads are covered.
 
 This repository should still be treated as pre-production infrastructure:
 
-- `ListenPacket` exposes a provisional unconnected UDP API, but VPP needs a
-  per-peer adapter before arbitrary `ReadFrom` and `WriteTo` semantics work end
-  to end. Its integration test is intentionally skipped.
+- `ListenPacket` implements a per-peer session adapter over VPP's
+  session-oriented UDP. `ReadFrom` works for any peer; `WriteTo` only reaches
+  peers that have already sent data (VPP cannot originate a session to an
+  arbitrary address from a listener). For sending to new addresses, use
+  connected UDP via `Dial("udp", addr)`. Mode 3 only.
 - VLS Mode 3 remains the default compatibility path. Opt-in Mode 2 now uses N
   session-affine, lifetime-pinned workers with per-worker epoll and no shared
   poller. It requires `multi-thread-workers` and remains behind rollout, soak,
@@ -53,7 +55,7 @@ The canonical, prioritized pending-work list is in
 | TCP reads, writes, close, addresses, and resettable deadlines | Integrated |
 | `ListenContext` / `TCPListener.AcceptContext` | Integrated |
 | Connected UDP via `Dial("udp", "udp4", "udp6", ...)` | Integrated on IPv4 and IPv6 in Mode 3; Mode 2 returns `EOPNOTSUPP` |
-| Unconnected UDP via `ListenPacket` | Provisional; not end-to-end supported |
+| Unconnected UDP via `ListenPacket` | Per-peer session adapter in Mode 3; `ReadFrom` for any peer, `WriteTo` to known peers only |
 | `Transport` / `NewHTTPClient` | HTTP/1.1 integration covered |
 | `crypto/tls` layered over a vclnet TCP connection | Integrated |
 | Native VCL TLS (`VPPCOM_PROTO_TLS`) via `DialTLS` / `ListenTLS` | Integrated; VPP terminates TLS, no `crypto/tls` on the caller side |
@@ -129,8 +131,29 @@ _ = err
 
 Connected UDP currently requires Mode 3.
 
-Do not use the classic unconnected `ListenPacket` receive loop yet; see the
-pending-work list.
+Unconnected UDP (per-peer session adapter):
+
+```go
+pc, err := vclnet.ListenPacket("udp4", ":9000")
+if err != nil {
+    // handle error
+}
+defer pc.Close()
+
+buf := make([]byte, 65536)
+n, addr, err := pc.ReadFrom(buf)
+if err != nil {
+    // handle error
+}
+// Reply to the peer that sent data (WriteTo only works for known peers).
+_, err = pc.WriteTo(buf[:n], addr)
+_ = err
+```
+
+`WriteTo` to an address that has not sent data returns `vclnet.ErrUnknownPeer`.
+VPP's UDP model is session-based — each peer gets its own internal session only
+after it contacts this listener. For sending to arbitrary addresses, use
+connected UDP via `Dial`.
 
 TCP half-close:
 
@@ -251,6 +274,7 @@ func DialTLSContext(ctx context.Context, network, address string, cfg *TLSConfig
 func ListenTLS(network, address string, cfg *TLSConfig) (net.Listener, error)
 var ErrTLSMissingCert error
 var ErrTLSPartialCert error
+var ErrUnknownPeer error // WriteTo to address not seen via ReadFrom
 
 func Shutdown()
 func ShutdownDone() <-chan struct{}
@@ -380,23 +404,23 @@ by `test/env.sh` — see that file for the full list.
 
 Current top-level coverage consists of:
 
-- 152 no-VPP tests across the public package, Mode 3 poller, and Mode 2 workers;
-- 32 runnable public-package single-worker integration tests, plus two
-  deliberately skipped tests (unconnected-UDP and half-close over cut-through);
+- 165 no-VPP tests across the public package, Mode 3 poller, Mode 2 workers,
+  and sharded listeners;
+- 33 runnable public-package single-worker integration tests, plus one
+  deliberately skipped test (half-close over cut-through);
 - 2 low-level VCL poll integration tests;
-- 5 multi-worker stress tests plus 2 Mode 2 invariants for ownership and safe
-  UDP rejection;
+- 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
+  invariants for ownership and safe UDP rejection;
 - 2 opt-in benchmarks.
 
 Use `go test -list .` and the test source as the source of truth; counts may
 change as coverage grows.
 
-The integration suite covers TCP in both modes and Mode 3 connected UDP on
-IPv4/IPv6, deadline expiry and reset, deadline updates during a blocked read,
-close unblocking,
-concurrent blocked read/write on a payload larger than the FIFO, HTTP, layered
-TLS, Happy Eyeballs, context-aware accept, shutdown, address reporting, and
-multi-worker stress.
+The integration suite covers TCP in both modes, Mode 3 connected UDP on
+IPv4/IPv6, unconnected UDP PacketConn echo, deadline expiry and reset, deadline
+updates during a blocked read, close unblocking, concurrent blocked read/write
+on a payload larger than the FIFO, HTTP, layered TLS, Happy Eyeballs,
+context-aware accept, shutdown, address reporting, and multi-worker stress.
 
 ## Repository layout
 

@@ -703,21 +703,23 @@ Since VPP does not ship a `.pc` file today, the repository provides `pkgconfig/v
 ### 10.3 Surface area
 
 The public package currently exposes initialization and shutdown, TCP
-listen/dial APIs, provisional UDP `ListenPacket`, connected UDP dialing,
-context-aware dialing and accept, native VCL TLS (`DialTLS` / `ListenTLS`,
-described in [§12.5](#125-native-vcl-tls-vppcom_proto_tls)), an HTTP
-transport/client, and error classification helpers. See the API list in
-[../README.md](../README.md).
+listen/dial APIs, unconnected UDP `ListenPacket` (per-peer session adapter),
+connected UDP dialing, context-aware dialing and accept, native VCL TLS
+(`DialTLS` / `ListenTLS`, described in
+[§12.5](#125-native-vcl-tls-vppcom_proto_tls)), an HTTP transport/client, and
+error classification helpers. See the API list in [../README.md](../README.md).
 
 The TCP connection implements `Read`, `Write`, `Close`, `CloseRead`,
 `CloseWrite`, address access, and resettable deadlines. Deadline changes
 wake an operation already parked in the selected readiness dispatcher.
 `CloseRead` and `CloseWrite` map to `vls_shutdown(SHUT_RD)` and
 `vls_shutdown(SHUT_WR)` respectively and are described in
-[§12.4](#124-tcp-half-close-and-vls_shutdown). The UDP connection implements
-connected `net.Conn` behavior; its arbitrary-peer `PacketConn` behavior
-remains incomplete because VPP accepts incoming UDP peers as separate
-sessions.
+[§12.4](#124-tcp-half-close-and-vls_shutdown). The connected UDP connection
+implements `net.Conn` behavior. Unconnected UDP (`ListenPacket`) uses a
+per-peer session adapter: VPP creates a separate VLS session for each peer
+that contacts the listener; the adapter accepts these sessions in a background
+loop, fans their data into `ReadFrom`, and routes `WriteTo` to the peer's
+session. Unknown peers return `ErrUnknownPeer`.
 
 The listener implementation supports both `Accept` and
 `AcceptContext`. Context expiry, listener close, and package shutdown remain
@@ -757,11 +759,14 @@ N goroutines and locks each to one OS thread for its lifetime. Worker 0 calls
 After all registrations finish, each worker creates its own epoll handle and
 runs a bounded operation-drain plus epoll loop.
 
-Creation operations are round-robin. Accepted sessions inherit the listener
-owner. Every read, write, attribute query, wait registration, cancellation, and
-close is submitted to that same worker. The dispatcher checks raw ownership
-before each operation, so cross-worker migration is rejected rather than
-triggered.
+Creation operations are round-robin. Listeners use per-worker sharding: each
+`Listen` or `ListenTLS` call creates one VLS listener per worker on the same
+address:port (via `SO_REUSEPORT`), runs a per-worker accept loop, and fans
+accepted connections into a shared channel. Accepted sessions inherit the
+accepting worker's ownership. Every read, write, attribute query, wait
+registration, cancellation, and close is submitted to that same worker. The
+dispatcher checks raw ownership before each operation, so cross-worker
+migration is rejected rather than triggered.
 
 Raw VLS handles are indexes in a per-worker pool, so Mode 2 must not expose
 them as process-wide identities. Its internal virtual handles disambiguate raw
@@ -1260,10 +1265,12 @@ Go callers
 ```
 
 This is the only safe way to obtain Mode 2 parallelism without VLS session
-migration. `test/run_multiworker.sh --mode 2` enables the matching VCL token,
-sets the worker count, runs the stress suite, and checks that every ownership
-preflight stayed on the expected VCL worker. Mode 3 remains the default while
-Mode 2 completes soak, listener-sharding, and performance rollout gates.
+migration. Listeners use per-worker sharding (`SO_REUSEPORT`) with per-worker
+accept loops fanning into a shared channel. `test/run_multiworker.sh --mode 2`
+enables the matching VCL token, sets the worker count, runs the stress suite
+(including a 16-connection sharded-accept scaling test), and checks that every
+ownership preflight stayed on the expected VCL worker. Mode 3 remains the
+default while Mode 2 completes soak and performance rollout gates.
 
 ---
 
@@ -1323,22 +1330,22 @@ fixed build are required before Mode 2 UDP can be enabled.
 
 ## 16. Current Status and Pending Work
 
-The implementation covers TCP on IPv4 and IPv6 in both modes and connected UDP
-in Mode 3, plus context-aware connect and accept, resettable deadlines,
-HTTP/1.1, layered TLS, native VCL TLS (`DialTLS`/`ListenTLS` on top of
-`VPPCOM_PROTO_TLS`), shutdown, TCP half-close, and multi-VPP-worker stress.
-Mode 3 remains the default compatibility dispatcher. Mode 2 is implemented as
-an opt-in, session-affine TCP worker pool with per-worker epoll, virtual
-handles, ownership preflight, exact cancellation, ordered teardown, and
-fail-fast UDP rejection.
+The implementation covers TCP on IPv4 and IPv6 in both modes, connected UDP
+in Mode 3, and unconnected UDP via a per-peer session adapter (`ListenPacket`),
+plus context-aware connect and accept, resettable deadlines, HTTP/1.1, layered
+TLS, native VCL TLS (`DialTLS`/`ListenTLS` on top of `VPPCOM_PROTO_TLS`),
+shutdown, TCP half-close, and multi-VPP-worker stress. Mode 3 remains the
+default compatibility dispatcher. Mode 2 is implemented as an opt-in,
+session-affine TCP worker pool with per-worker epoll, per-worker sharded
+listeners, virtual handles, ownership preflight, exact cancellation, ordered
+teardown, and fail-fast UDP rejection.
 
-It is not accurate to describe the library as production-complete. Unconnected
-UDP `PacketConn` semantics are incomplete. Mode 2 UDP is disabled pending a VPP
-cleanup fix, and Mode 2 still needs sustained supported-surface and teardown
-soak, sharded listeners, CI history, and a reproducible performance baseline
-before it can become the default. HTTP/2, current gRPC, extended native TLS
-controls (SNI, ALPN, verify hooks via `SET_ENDPT_EXT_CFG`), and a VPP version
-matrix also remain open.
+It is not accurate to describe the library as production-complete. Mode 2 UDP
+is disabled pending a VPP cleanup fix, and Mode 2 still needs sustained
+supported-surface and teardown soak, CI history, and a reproducible performance
+baseline before it can become the default. HTTP/2, current gRPC, extended
+native TLS controls (SNI, ALPN, verify hooks via `SET_ENDPT_EXT_CFG`), and a
+VPP version matrix also remain open.
 
 The canonical prioritized list is
 [../summary.md](../summary.md#3-pending-work). It supersedes older roadmap
@@ -1389,7 +1396,8 @@ This enables the session layer and the SEQPACKET app-socket-api endpoint.
 | `vclnet/vclnet.go` | Public `Options`, `Init`, `InitWithOptions`, `Listen`, `ListenContext`, `ListenPacket`, `Dial`, `DialContext`, `DialTimeout`, `TCPListener`, `Shutdown`, `InstallSignalHandler` |
 | `vclnet/dialer.go` | `Dialer` struct, `DialContext`, Happy Eyeballs (`dialHappyEyeballs`, `interleaveAddrs`) |
 | `vclnet/conn.go` | `tcpConn` (`net.Conn`) — Read/Write/Close/deadlines |
-| `vclnet/udpconn.go` | `udpConn` (`net.Conn`; provisional `net.PacketConn`) — connected UDP is validated in Mode 3 |
+| `vclnet/udpconn.go` | `udpConn` (`net.Conn`) — connected UDP is validated in Mode 3 |
+| `vclnet/packetconn.go` | `packetConn` (`net.PacketConn`) — per-peer session adapter for unconnected UDP |
 | `vclnet/listener.go` | `tcpListener` (`net.Listener` with `AcceptContext`) — Accept/Close/doneCh |
 | `vclnet/shutdown.go` | `Shutdown()`, `ShutdownDone()`, `InstallSignalHandler()` |
 | `vclnet/transport.go` | `Transport()`, `DefaultTransport`, `NewHTTPClient()` — HTTP connection pooling |
@@ -1400,6 +1408,7 @@ This enables the session layer and the SEQPACKET app-socket-api endpoint.
 | `vclnet/internal/vclpoll/poller.go` | Mode 3 shared poller and exact waiter state |
 | `vclnet/internal/vclpoll/mode2.go` | Virtual handles, owner registry, and operation routing |
 | `vclnet/internal/vclpoll/worker.go` | Lifetime-pinned Mode 2 loops, per-worker epoll, waiters, and teardown |
+| `vclnet/internal/vclpoll/shard_listener.go` | Per-worker listener sharding and accept fan-in |
 | `vclnet/examples/*` | Echo + HTTP servers/clients (drop-in for stdlib `net`) |
 | `vclnet/test/run_integration.sh` | Full integration harness (starts VPP, runs tests) |
 | `vclnet/docs/architecture.md` | Architecture + design rationale |
@@ -1475,5 +1484,6 @@ That is why vclnet is the production path and Frida wasn't: it draws the boundar
 The normal VCL path can select cut-through when both apps and scopes permit it.
 Mode 3 and the session-affine Mode 2 TCP worker pool are both implemented; Mode
 2 UDP remains fail-fast pending a VPP cleanup fix, and Mode 2 remains opt-in
-while listener sharding, cleanup soak, CI history, and a reproducible
-performance baseline remain open.
+while cleanup soak, CI history, and a reproducible performance baseline remain
+open. Mode 2 listeners use per-worker sharding with `SO_REUSEPORT` and accept
+fan-in.

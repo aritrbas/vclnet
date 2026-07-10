@@ -9,20 +9,21 @@ syscalls directly and cannot treat a VCL session handle as a kernel file
 descriptor.
 
 The current repository demonstrates a viable architecture for TCP in both VLS
-modes and connected UDP in the default Mode 3 path. Its isolated VPP test
-harness covers IPv4, IPv6, HTTP/1.1, layered TLS, native VCL TLS,
-context cancellation, live deadlines, concurrent reads/writes, shutdown, and
-VPP configured with multiple worker threads.
+modes, connected UDP in the default Mode 3 path, and unconnected UDP via a
+per-peer session adapter (`ListenPacket`). Its isolated VPP test harness covers
+IPv4, IPv6, HTTP/1.1, layered TLS, native VCL TLS, context cancellation, live
+deadlines, concurrent reads/writes, shutdown, PacketConn echo, and VPP
+configured with multiple worker threads.
 
 It is not yet a generally distributable production library. The highest
-priority gaps are automated VPP compatibility CI, completion of Mode 2 rollout
-validation, and a decision on the incomplete unconnected-UDP API. Mode 3
-remains the compatibility default. An opt-in Mode 2 implementation now uses
-fixed, session-affine worker loops for application-side parallelism, but
-its rollout still requires sustained CI, listener sharding, soak testing, and a
-performance baseline. The pinned VPP 26.10 build crashes during Mode 2
-cut-through UDP cleanup, so Mode 2 rejects UDP before allocating VLS state and
-preserves `errors.Is(err, syscall.EOPNOTSUPP)`.
+priority gaps are automated VPP compatibility CI and completion of Mode 2
+rollout validation. Mode 3 remains the compatibility default. An opt-in Mode 2
+implementation now uses fixed, session-affine worker loops with per-worker
+sharded listeners for application-side parallelism, but its rollout still
+requires sustained CI, soak testing, and a performance baseline. The pinned VPP
+26.10 build crashes during Mode 2 cut-through UDP cleanup, so Mode 2 rejects
+UDP before allocating VLS state and preserves
+`errors.Is(err, syscall.EOPNOTSUPP)`.
 
 The prioritized source of truth is
 [../summary.md](../summary.md#3-pending-work).
@@ -86,15 +87,15 @@ thread.
 
 ## 3. Current evidence
 
-The no-VPP suite has 152 top-level tests. The VPP-backed suites contain:
+The no-VPP suite has 165 top-level tests. The VPP-backed suites contain:
 
-- 32 runnable public-package single-worker tests (including native VCL TLS,
-  half-close, layered TLS, deadline, and Happy Eyeballs tests);
+- 33 runnable public-package single-worker tests (including native VCL TLS,
+  half-close, layered TLS, deadline, PacketConn echo, and Happy Eyeballs
+  tests);
 - 2 low-level VCL poll tests;
-- 5 multi-worker stress tests plus 2 Mode 2 ownership and UDP-rejection
-  invariant tests;
-- 2 deliberately skipped tests (unconnected-UDP and half-close over
-  cut-through transport);
+- 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
+  ownership and UDP-rejection invariant tests;
+- 1 deliberately skipped test (half-close over cut-through transport);
 - 2 opt-in benchmarks.
 
 Covered behavior includes:
@@ -103,6 +104,8 @@ Covered behavior includes:
   (`CloseRead` → local `io.EOF`; `CloseWrite` → peer FIN and local
   `net.ErrClosed`);
 - connected UDP IPv4/IPv6 in Mode 3;
+- unconnected UDP (`ListenPacket`) with per-peer session adapter in Mode 3
+  (3-message echo round-trip validated);
 - HTTP/1.1 requests, responses, keep-alive-configured requests, and the public client helper;
 - standard `crypto/tls` over a VCL-backed connection;
 - native VCL TLS (`DialTLS`/`ListenTLS`) via VPP's OpenSSL engine with
@@ -123,10 +126,8 @@ release-build tree. This is local evidence, not yet a compatibility matrix.
 
 The repository does not currently establish:
 
-- correct arbitrary-peer `net.PacketConn` behavior;
 - safe Mode 2 UDP in the pinned VPP build;
 - sustained full-surface and soak validation of VLS Mode 2;
-- sharded Mode 2 listeners and accept fan-in;
 - clean-host packaging across supported distributions and VPP installs;
 - HTTP/2 or current gRPC interoperability;
 - extended native TLS controls (SNI matching, ALPN, verify hooks, session
@@ -159,8 +160,10 @@ returns `EOPNOTSUPP` before VLS allocation.
 Raw VLS handles collide across worker-local pools, so Mode 2 maps a
 process-unique internal handle to `{owner, raw}`. Before each operation it
 checks the raw VCL worker index and rejects a mismatch before VLS can enter its
-migration or clone path. The current listener design keeps a listener and all
-of its accepts on one worker; per-worker listener sharding is a rollout item.
+migration or clone path. Listeners use per-worker sharding: each `Listen` or
+`ListenTLS` call creates one VLS listener per worker on the same address:port
+using `SO_REUSEPORT`, runs a per-worker accept loop, and fans accepted
+connections into a shared channel.
 
 A VPP process configured with `cpu { workers N }` can distribute VPP-side work
 in either VLS mode. It does not by itself select application-side Mode 2.
@@ -192,10 +195,10 @@ A production performance report should capture raw data for:
 | --- | --- | --- |
 | Clean-host packaging | pkg-config template and prefix-driven Make targets | Validate supported distro and container builds |
 | VPP API/behavior drift | Integration harness exercises local VPP | P0 automated version matrix |
-| Incomplete UDP surface | Mode 3 connected UDP tested; unconnected test skipped | Implement adapter or deprecate API |
+| Unconnected UDP limitation | Per-peer session adapter implemented; `WriteTo` only reaches known peers | Document or mitigate the no-originate-session VPP constraint |
 | Connect failure ambiguity | Immediate hard failures are wrapped | Add reliable post-EPOLLOUT error query/tests |
 | Lifecycle races | Shutdown gates new work and wakes dispatcher waits | Track/drain all live objects and soak test |
-| Mode 2 rollout risk | Session-affine pool, ownership preflight, dual-mode harness | Add listener sharding, full-surface soak, CI history, and performance baseline |
+| Mode 2 rollout risk | Session-affine pool, ownership preflight, per-worker sharded listeners, dual-mode harness | Full-surface soak, CI history, and performance baseline |
 | Mode 2 cut-through UDP crash | UDP fails before VLS allocation; harness probes VPP after tests | Produce and report a minimal reproducer; enable only on a verified-safe VPP build |
 | Unsupported ecosystem assumptions | Docs now distinguish tested vs inferred | Add HTTP/2/gRPC/application-specific tests |
 
@@ -208,10 +211,9 @@ Before broad production adoption:
 
 1. validate clean-host and container packaging against supported VPP installs;
 2. put the isolated VPP suites in CI against pinned versions;
-3. resolve the `ListenPacket` contract;
-4. add application-protocol and lifecycle soak tests;
-5. collect a reproducible performance baseline;
-6. keep Mode 2 opt-in until sustained CI and measurements establish both
+3. add application-protocol and lifecycle soak tests;
+4. collect a reproducible performance baseline;
+5. keep Mode 2 opt-in until sustained CI and measurements establish both
    correctness and a useful gain over Mode 3.
 
 A narrower deployment can proceed earlier when its workload uses the tested

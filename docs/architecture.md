@@ -70,7 +70,8 @@ repository has completed every production-hardening item.
 | dialer.go       context dialing and Happy Eyeballs             |
 | listener.go     listener and AcceptContext                     |
 | conn.go         TCP Conn and resettable deadlines              |
-| udpconn.go      connected UDP; provisional PacketConn surface  |
+| udpconn.go      connected UDP net.Conn                         |
+| packetconn.go   per-peer session adapter for net.PacketConn    |
 | transport.go    HTTP transport/client                          |
 | shutdown.go     package lifecycle                              |
 | addr/errors.go  resolver and net.OpError adaptation            |
@@ -104,6 +105,7 @@ Implemented and integrated:
 
 - TCP IPv4 and IPv6 listen, accept, connect, read, write, close;
 - connected UDP IPv4 and IPv6 in Mode 3;
+- unconnected UDP (`ListenPacket`) with a per-peer session adapter in Mode 3;
 - context-aware TCP connection setup in both modes and UDP setup in Mode 3;
 - dual-stack Happy Eyeballs for `"tcp"`;
 - resettable read/write deadlines that affect blocked operations;
@@ -117,16 +119,19 @@ Implemented and integrated:
 
 Provisional or absent:
 
-- arbitrary-peer unconnected UDP;
 - Mode 2 UDP, which returns an error wrapping `EOPNOTSUPP`;
 - extended native TLS controls (SNI, ALPN, verify hooks via
   `SET_ENDPT_EXT_CFG`);
 - fd extraction;
 - HTTP/2 and gRPC validation.
 
-Although the dynamic UDP type satisfies both `net.Conn` and
-`net.PacketConn`, `ListenPacket` is not end-to-end supported until a
-per-peer session adapter exists.
+`ListenPacket` returns a `net.PacketConn` backed by a per-peer session adapter.
+VPP's UDP model creates a separate VLS session for each peer that contacts the
+listener. The adapter accepts these sessions in a background loop and fans
+their data into `ReadFrom`. `WriteTo` routes to the peer's session if one
+exists; otherwise it returns `ErrUnknownPeer`. This semantic difference from
+kernel UDP (which can `sendto` arbitrary addresses) is inherent to VPP's
+session layer.
 
 ## 5. Threading boundaries
 
@@ -267,9 +272,13 @@ returns a successful connection is drained and closed.
 ### UDP
 
 Mode 3 connected UDP uses the same split connect/poller cancellation pattern.
-The server-side VPP UDP model is session-oriented: a bound/listening UDP VLS handle
-accepts per-peer sessions. vclnet does not yet translate that model into
-arbitrary-peer `PacketConn` semantics.
+
+`ListenPacket` creates a bound UDP VLS listener and wraps it in a per-peer
+session adapter (`packetConn`). VPP's server-side UDP is session-oriented: each
+peer that contacts the listener gets its own VLS session (accepted like TCP).
+The adapter runs a background accept loop, spawns a reader goroutine per peer,
+and fans data into a shared channel for `ReadFrom`. `WriteTo` routes to the
+peer's accepted session; unknown peers return `ErrUnknownPeer`.
 
 Mode 2 UDP is deliberately unavailable on the pinned VPP 26.10 build because
 closing a cut-through datagram session can leave VPP with a stale TX event.

@@ -152,10 +152,20 @@ func Listen(network, address string) (net.Listener, error) {
 	return newTCPListener(vlsh, addr, network), nil
 }
 
-// ListenPacket creates a provisional VLS UDP listener in Mode 3. Mode 2
-// returns an error wrapping syscall.EOPNOTSUPP before VLS allocation.
-// Connected UDP via Dial is supported in Mode 3; arbitrary-peer PacketConn
-// semantics are not yet implemented end to end (see summary.md).
+// ListenPacket creates a UDP PacketConn backed by VPP's session-based UDP
+// model. Mode 2 returns an error wrapping syscall.EOPNOTSUPP before VLS
+// allocation.
+//
+// VPP's UDP layer is session-oriented: each peer that sends data to this
+// address gets its own internal VLS session (similar to TCP accept). The
+// returned PacketConn transparently manages these per-peer sessions:
+//
+//   - ReadFrom returns datagrams from any peer along with the sender's address.
+//   - WriteTo routes data to a peer's session. The peer must have previously
+//     sent data (VPP cannot originate a session to an arbitrary address from a
+//     listener). WriteTo to an unknown peer returns ErrUnknownPeer.
+//
+// For sending to arbitrary addresses, use connected UDP via Dial("udp", addr).
 //
 // The network must be "udp", "udp4", or "udp6".
 //
@@ -214,8 +224,7 @@ func ListenPacket(network, address string) (net.PacketConn, error) {
 		return nil, opError("listen", network, address, err)
 	}
 	addr = udpAddrFromInfo(info)
-	conn := newUDPConn(vlsh, addr, false)
-	return conn, nil
+	return newPacketConn(vlsh, addr), nil
 }
 
 // DialContext connects to the address on the named network, respecting the

@@ -1627,6 +1627,126 @@ func TestUDPConnWriteAfterClosePrecedesMissingPeer(t *testing.T) {
 	}
 }
 
+func TestPacketConnWriteToUnknownPeerReturnsError(t *testing.T) {
+	pc := &packetConn{
+		listenerVLSH:  0,
+		localAddr:     &net.UDPAddr{IP: net.IPv4zero, Port: 9000},
+		stopCh:        make(chan struct{}),
+		peers:         make(map[peerKey]*peerSession),
+		incoming:      make(chan incomingDatagram, 1),
+		readDeadline:  newDeadlineState(),
+		writeDeadline: newDeadlineState(),
+	}
+	_, err := pc.WriteTo([]byte("hello"), &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 5000})
+	if !errors.Is(err, ErrUnknownPeer) {
+		t.Fatalf("WriteTo unknown peer: got %v, want ErrUnknownPeer", err)
+	}
+}
+
+func TestPacketConnWriteToKnownPeerRoutes(t *testing.T) {
+	pc := &packetConn{
+		listenerVLSH:  0,
+		localAddr:     &net.UDPAddr{IP: net.IPv4zero, Port: 9000},
+		stopCh:        make(chan struct{}),
+		peers:         make(map[peerKey]*peerSession),
+		incoming:      make(chan incomingDatagram, 1),
+		readDeadline:  newDeadlineState(),
+		writeDeadline: newDeadlineState(),
+	}
+	peerAddr := &net.UDPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 5000}
+	key := addrToKey(peerAddr)
+	pc.peers[key] = &peerSession{vlsh: 42, addr: peerAddr}
+
+	// WriteTo will call vclpoll.WriteContext which will fail without VPP,
+	// but it should NOT return ErrUnknownPeer — it should attempt the write.
+	_, err := pc.WriteTo([]byte("hello"), peerAddr)
+	if errors.Is(err, ErrUnknownPeer) {
+		t.Fatal("WriteTo known peer returned ErrUnknownPeer")
+	}
+	// Any other error (ErrClosed from VLS not being live) is acceptable.
+}
+
+func TestPacketConnReadFromRespectsClose(t *testing.T) {
+	pc := &packetConn{
+		listenerVLSH:  0,
+		localAddr:     &net.UDPAddr{IP: net.IPv4zero, Port: 9000},
+		stopCh:        make(chan struct{}),
+		peers:         make(map[peerKey]*peerSession),
+		incoming:      make(chan incomingDatagram, 1),
+		readDeadline:  newDeadlineState(),
+		writeDeadline: newDeadlineState(),
+	}
+	close(pc.stopCh)
+	pc.closed.Store(true)
+	_, _, err := pc.ReadFrom(make([]byte, 64))
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("ReadFrom after close: got %v, want ErrClosed", err)
+	}
+}
+
+func TestPacketConnReadFromDelivery(t *testing.T) {
+	pc := &packetConn{
+		listenerVLSH:  0,
+		localAddr:     &net.UDPAddr{IP: net.IPv4zero, Port: 9000},
+		stopCh:        make(chan struct{}),
+		peers:         make(map[peerKey]*peerSession),
+		incoming:      make(chan incomingDatagram, 1),
+		readDeadline:  newDeadlineState(),
+		writeDeadline: newDeadlineState(),
+	}
+	peerAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 1), Port: 4321}
+	pc.incoming <- incomingDatagram{data: []byte("test-data"), addr: peerAddr}
+
+	buf := make([]byte, 64)
+	n, addr, err := pc.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if string(buf[:n]) != "test-data" {
+		t.Errorf("ReadFrom data: got %q, want %q", string(buf[:n]), "test-data")
+	}
+	if addr.String() != peerAddr.String() {
+		t.Errorf("ReadFrom addr: got %v, want %v", addr, peerAddr)
+	}
+}
+
+func TestPacketConnWriteToNilAddrError(t *testing.T) {
+	pc := &packetConn{
+		listenerVLSH:  0,
+		localAddr:     &net.UDPAddr{IP: net.IPv4zero, Port: 9000},
+		stopCh:        make(chan struct{}),
+		peers:         make(map[peerKey]*peerSession),
+		incoming:      make(chan incomingDatagram, 1),
+		readDeadline:  newDeadlineState(),
+		writeDeadline: newDeadlineState(),
+	}
+	_, err := pc.WriteTo([]byte("x"), nil)
+	if err == nil {
+		t.Fatal("WriteTo nil addr should fail")
+	}
+	var addrErr *net.AddrError
+	if !errors.As(err, &addrErr) {
+		t.Fatalf("WriteTo nil: want AddrError, got %T: %v", err, err)
+	}
+}
+
+func TestPacketConnReadDeadlineExpiry(t *testing.T) {
+	pc := &packetConn{
+		listenerVLSH:  0,
+		localAddr:     &net.UDPAddr{IP: net.IPv4zero, Port: 9000},
+		stopCh:        make(chan struct{}),
+		peers:         make(map[peerKey]*peerSession),
+		incoming:      make(chan incomingDatagram, 1),
+		readDeadline:  newDeadlineState(),
+		writeDeadline: newDeadlineState(),
+	}
+	_ = pc.SetReadDeadline(time.Now().Add(-time.Second))
+	_, _, err := pc.ReadFrom(make([]byte, 64))
+	if !IsTimeout(err) {
+		t.Fatalf("ReadFrom with past deadline: got %v, want timeout", err)
+	}
+}
+
 func TestTCPListenerAcceptContextPreCancelled(t *testing.T) {
 	l := newTCPListener(0, &net.TCPAddr{IP: net.IPv4zero, Port: 9000}, "tcp")
 	ctx, cancel := context.WithCancel(context.Background())

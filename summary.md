@@ -19,6 +19,7 @@ VCL worker.
 | Concurrent I/O | One session can retain separate read and write waiters | Readiness state-machine tests plus 6 MiB TCP integration |
 | Listener cancellation | `TCPListener.AcceptContext` distinguishes context expiry from listener or package close | Unit plus VPP integration |
 | Connected UDP | `Dial("udp*")`, read, write, and deadlines on IPv4 and IPv6 in Mode 3; Mode 2 fails before allocation with `EOPNOTSUPP` | VPP integration plus Mode 2 rejection tests |
+| Unconnected UDP (PacketConn) | `ListenPacket("udp*")` with per-peer session adapter; `ReadFrom` receives from any peer, `WriteTo` routes to known peers (those that have sent data). Mode 3 only | Unit tests plus VPP integration (echo round-trip with 3 messages) |
 | HTTP and layered TLS | HTTP/1.1 and standard `crypto/tls` over vclnet TCP | VPP integration |
 | Native VCL TLS | `DialTLS` / `ListenTLS` route TLS termination into VPP via `VPPCOM_PROTO_TLS` (OpenSSL engine, `vppcom_add_cert_key_pair` + `SET_CKPAIR`). No `crypto/tls` on the caller side | Unit config + VPP integration (echo, 128 KiB fragmentation, layered/native parity) |
 | Shutdown | Idempotent, wakes parked operations, stops VLS workers, and rejects later operations | Unit and subprocess VPP integration |
@@ -70,13 +71,11 @@ gaps remain release blockers:
 
 ## 2. Test inventory
 
-The repository currently has 159 top-level no-VPP tests:
+The repository currently has 165 top-level no-VPP tests:
 
-- 129 public-package contract and unit tests (including native VCL TLS
-  contract tests covering server-side cert requirement, client-side
-  anonymous mode, partial-config rejection, UDP-network rejection,
-  unknown-network rejection, canceled-context short-circuit, hash-based
-  ckpair dedup, and big-endian length prefixing);
+- 135 public-package contract and unit tests (including native VCL TLS
+  contract tests, PacketConn per-peer adapter tests, and connected UDP
+  error-handling tests);
 - 9 shared Mode 3 poller tests;
 - 11 Mode 2 worker, ownership, parking, UDP rejection, and shutdown tests;
 - 7 sharded listener tests (per-worker creation, accept fan-in, context
@@ -85,11 +84,10 @@ The repository currently has 159 top-level no-VPP tests:
 
 VPP-backed coverage currently has:
 
-- 32 runnable public-package tests in the standard integration harness
+- 33 runnable public-package tests in the standard integration harness
   (including native VCL TLS, half-close, layered-TLS, deadline,
-  Happy Eyeballs, shutdown, and address tests);
-- 2 deliberately skipped tests (unconnected-UDP `PacketConn` and
-  half-close over cut-through transport);
+  Happy Eyeballs, shutdown, PacketConn echo, and address tests);
+- 1 deliberately skipped test (half-close over cut-through transport);
 - 2 low-level vclpoll echo tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
   ownership and UDP-rejection invariant tests;
@@ -99,9 +97,9 @@ The standard harness exercises TCP IPv4 and IPv6, connected UDP IPv4 and IPv6,
 HTTP, layered TLS, native VCL TLS (short and 128 KiB fragmented echo plus a
 native-vs-layered parity test), Happy Eyeballs, context-aware accept,
 deadline expiry and updates, close-unblock behavior, simultaneous blocked
-read and write, address reporting, shutdown, and TCP half-close (both
-`CloseWrite` peer-EOF and `CloseRead` local-EOF paths, plus parked-writer
-wake-up).
+read and write, PacketConn echo via per-peer session adapter, address
+reporting, shutdown, and TCP half-close (both `CloseWrite` peer-EOF and
+`CloseRead` local-EOF paths, plus parked-writer wake-up).
 
 Commands:
 
@@ -131,7 +129,7 @@ maintaining independent roadmaps.
 | P0 | Replace Mode 2 thread-retirement polling | Remove `/proc/self/task` polling and the process-main-thread exception; use an explicit worker terminal state or supported unregister/join mechanism, prove no VLS call or TLS destructor can race `vppcom_app_destroy`, and pass repeated shutdown stress |
 | P0 | Complete Mode 2 rollout validation | Run the full supported TCP integration surface, repeated shutdown cases, a long concurrency soak, and no-migration and safe-UDP-rejection assertions in CI; keep Mode 3 as default until the sustained-green and performance gates pass |
 | ~~P1~~ | ~~Shard Mode 2 listeners~~ | ~~Done. Per-worker listener sharding with SO_REUSEPORT and accept fan-in; validated with 16-connection sharded-accept integration test~~ |
-| P1 | Decide the unconnected UDP contract | Implement a per-peer session adapter with correct concurrent `PacketConn` behavior, or remove or deprecate `ListenPacket`; enable the skipped integration test |
+| ~~P1~~ | ~~Decide the unconnected UDP contract~~ | ~~Done. Per-peer session adapter: background accept loop + per-peer readers fan into ReadFrom; WriteTo routes to known peers. Integration test enabled~~ |
 | P1 | Verify asynchronous connect completion errors | Replace the EPOLLOUT-implies-success assumption when VPP exposes a reliable session error query, and add refused and unreachable integration cases |
 | P1 | Establish reproducible performance baselines | Record topology, hardware, VPP and kernel configs, payload and concurrency distributions, raw benchmark output, and comparisons before publishing speedup claims |
 | P1 | Harden lifecycle and graceful drain | Track live listeners and connections, define graceful-drain ordering, and stress concurrent Shutdown with active reads, writes, accepts, and dials |
@@ -141,9 +139,11 @@ maintaining independent roadmaps.
 
 ## 4. Known limitations
 
-1. **Unconnected UDP is incomplete.** `ListenPacket` can create a bound VLS
-   listener, but arbitrary peer-oriented `ReadFrom` and `WriteTo` behavior is
-   not implemented end to end. Use connected UDP in Mode 3.
+1. **Unconnected UDP uses a per-peer session model.** `ListenPacket` returns a
+   `PacketConn` backed by VPP's session-oriented UDP. `ReadFrom` works for any
+   peer that sends data; `WriteTo` only reaches peers already seen (VPP cannot
+   originate a session to an arbitrary address from a listener). For sending to
+   new addresses, use connected UDP via `Dial("udp", addr)`. Mode 3 only.
 2. **Mode 2 UDP is disabled.** The pinned VPP 26.10 build can crash after a
    Mode 2 connected-UDP close while processing stale cut-through TX state.
    Mode 2 UDP calls therefore fail before VLS allocation with an error wrapping

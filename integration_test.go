@@ -120,6 +120,8 @@ func runServerChild() {
 		runTLSEchoServer(port, nConns)
 	case "nativetls":
 		runNativeTLSEchoServer(port, nConns)
+	case "udp_client":
+		runUDPClient(port, nConns)
 	case "shutdown":
 		runShutdownSelfTest(port)
 	case "halfclose":
@@ -313,9 +315,19 @@ func cleanupCommand(tb interface{ Cleanup(func()) }, cmd *exec.Cmd) {
 	})
 }
 
+func startServerOnPort(t *testing.T, serverType string, nConns int, port uint16) (*exec.Cmd, uint16, *bytes.Buffer) {
+	t.Helper()
+	return doStartServer(t, serverType, nConns, port)
+}
+
 func startServer(t *testing.T, serverType string, nConns int) (*exec.Cmd, uint16, *bytes.Buffer) {
 	t.Helper()
 	port := reserveAPIPort()
+	return doStartServer(t, serverType, nConns, port)
+}
+
+func doStartServer(t *testing.T, serverType string, nConns int, port uint16) (*exec.Cmd, uint16, *bytes.Buffer) {
+	t.Helper()
 
 	exe, err := os.Executable()
 	if err != nil {
@@ -900,12 +912,78 @@ func TestUDPIPv4EchoSingle(t *testing.T) {
 	waitOrKill(t, cmd, stderr)
 }
 
+// runUDPClient is a child-process helper that connects to a PacketConn
+// listener, sends messages, and reads replies.
+func runUDPClient(port, nMsgs int) {
+	conn, err := vclnet.Dial("udp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: Dial udp4: %v\n", err)
+		os.Exit(2)
+	}
+	defer conn.Close()
+
+	fmt.Printf("READY %d\n", port)
+	os.Stdout.Sync()
+
+	for i := 0; i < nMsgs; i++ {
+		msg := fmt.Sprintf("packet-%d", i)
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			fmt.Fprintf(os.Stderr, "child: Write: %v\n", err)
+			os.Exit(2)
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		buf := make([]byte, 256)
+		n, err := conn.Read(buf)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "child: Read: %v\n", err)
+			os.Exit(2)
+		}
+		if string(buf[:n]) != msg {
+			fmt.Fprintf(os.Stderr, "child: echo mismatch: got %q want %q\n", string(buf[:n]), msg)
+			os.Exit(2)
+		}
+	}
+}
+
 func TestUDPIPv4PacketConn(t *testing.T) {
-	// VPP's UDP model is session-based: each peer creates a separate session.
-	// The classic unconnected datagram pattern (WriteTo/ReadFrom with arbitrary
-	// peers on a single socket) is not supported by VPP's session layer.
-	// Use connected UDP (Dial("udp", addr)) instead.
-	t.Skip("VPP UDP is session-based; unconnected PacketConn not supported")
+	skipIfNoVPP(t)
+	skipUDPInMode2(t)
+
+	if err := vclnet.Init("vclnet-test-packetconn"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	port := reserveAPIPort()
+	pc, err := vclnet.ListenPacket("udp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("ListenPacket: %v", err)
+	}
+	defer pc.Close()
+
+	// Start a child that connects to our PacketConn and sends messages.
+	cmd, _, stderr := startServerOnPort(t, "udp_client", 3, port)
+	defer cmd.Process.Kill()
+
+	_ = pc.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+	for i := 0; i < 3; i++ {
+		buf := make([]byte, 256)
+		n, addr, err := pc.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("ReadFrom[%d]: %v\nstderr:\n%s", i, err, stderr.String())
+		}
+		expected := fmt.Sprintf("packet-%d", i)
+		if string(buf[:n]) != expected {
+			t.Errorf("ReadFrom[%d]: got %q, want %q", i, string(buf[:n]), expected)
+		}
+
+		// Echo back via WriteTo.
+		if _, err := pc.WriteTo(buf[:n], addr); err != nil {
+			t.Fatalf("WriteTo[%d]: %v", i, err)
+		}
+	}
+
+	waitOrKill(t, cmd, stderr)
 }
 
 func TestUDPIPv6Echo(t *testing.T) {
