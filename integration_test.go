@@ -128,6 +128,14 @@ func runServerChild() {
 		runShutdownStressSelfTest(port)
 	case "halfclose":
 		runHalfCloseServer(port)
+	case "h2c":
+		runH2CServer(port)
+	case "h2tls":
+		runH2TLSServer(port)
+	case "grpc":
+		runGRPCServer(port)
+	case "grpctls":
+		runGRPCTLSServer(port)
 	default:
 		fmt.Fprintf(os.Stderr, "child: unknown server type %q\n", serverType)
 		os.Exit(2)

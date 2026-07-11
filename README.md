@@ -16,7 +16,8 @@ Frida goroutine shim is in
 
 The TCP path is implemented and passes the local VPP integration harness on
 IPv4 and IPv6 in both VLS modes. Connected UDP is integrated in the default
-Mode 3 path. HTTP/1.1, layered `crypto/tls`, context cancellation, live I/O
+Mode 3 path. HTTP/1.1, HTTP/2 (cleartext + TLS-with-ALPN), gRPC (unary +
+server-streaming, cleartext + TLS), layered `crypto/tls`, context cancellation, live I/O
 deadlines, Happy Eyeballs, concurrent I/O,
 shutdown, and VPP configurations with multiple worker threads are covered.
 
@@ -57,6 +58,8 @@ The canonical, prioritized pending-work list is in
 | Connected UDP via `Dial("udp", "udp4", "udp6", ...)` | Integrated on IPv4 and IPv6 in Mode 3; Mode 2 returns `EOPNOTSUPP` |
 | Unconnected UDP via `ListenPacket` | Per-peer session adapter in Mode 3; `ReadFrom` for any peer, `WriteTo` to known peers only |
 | `Transport` / `NewHTTPClient` | HTTP/1.1 integration covered |
+| HTTP/2 over vclnet | Cleartext (`http.Server.Protocols` + `http2.Transport.AllowHTTP`) and TLS-with-ALPN (`h2` via layered `crypto/tls`) integration covered |
+| gRPC over vclnet | Unary + server-streaming integration covered (cleartext and TLS); uses `grpc.WithContextDialer` to route through `vclnet.DialContext` |
 | `crypto/tls` layered over a vclnet TCP connection | Integrated |
 | Native VCL TLS (`VPPCOM_PROTO_TLS`) via `DialTLS` / `ListenTLS` | Integrated; VPP terminates TLS, no `crypto/tls` on the caller side |
 | TCP `CloseRead` / `CloseWrite` | Integrated via `vls_shutdown` (SHUT_RD is local-only EOF; SHUT_WR sends a peer FIN over full TCP; no-op over cut-through transport) |
@@ -412,9 +415,10 @@ Current top-level coverage consists of:
 
 - 173 no-VPP tests across the public package, lifecycle registry, Mode 3
   poller, Mode 2 workers, and sharded listeners;
-- 36 runnable public-package single-worker integration tests (including a
-  concurrent-Shutdown stress test and TCP/TLS connection-refused cases),
-  plus one deliberately skipped test (half-close over cut-through);
+- 40 runnable public-package single-worker integration tests (including a
+  concurrent-Shutdown stress test, TCP/TLS connection-refused cases,
+  HTTP/2 cleartext + TLS-ALPN, and gRPC cleartext + TLS), plus one
+  deliberately skipped test (half-close over cut-through);
 - 2 low-level VCL poll integration tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
   invariants for ownership and safe UDP rejection;
@@ -424,7 +428,9 @@ Use `go test -list .` and the test source as the source of truth; counts may
 change as coverage grows.
 
 The integration suite covers TCP in both modes, Mode 3 connected UDP on
-IPv4/IPv6, unconnected UDP PacketConn echo, deadline expiry and reset, deadline
+IPv4/IPv6, unconnected UDP PacketConn echo, HTTP/1.1, HTTP/2 (cleartext and
+TLS-with-ALPN), gRPC (cleartext and TLS, unary and server-streaming),
+deadline expiry and reset, deadline
 updates during a blocked read, close unblocking, concurrent blocked read/write
 on a payload larger than the FIFO, HTTP, layered TLS, Happy Eyeballs,
 context-aware accept, shutdown, address reporting, and multi-worker stress.
@@ -436,6 +442,7 @@ context-aware accept, shutdown, address reporting, and multi-worker stress.
 |-- *.go                         public package implementation
 |-- vclnet_test.go               no-VPP contract tests
 |-- integration_test.go          VPP integration tests and benchmarks
+|-- h2_grpc_test.go              HTTP/2 and gRPC integration tests
 |-- internal/vclpoll/
 |   |-- cgo.go                   VLS CGo bridge (links via pkg-config)
 |   |-- dispatch.go              stable Mode 2 and Mode 3 dispatcher boundary

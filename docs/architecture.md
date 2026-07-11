@@ -111,7 +111,8 @@ Implemented and integrated:
 - dual-stack Happy Eyeballs for `"tcp"`;
 - resettable read/write deadlines that affect blocked operations;
 - context-aware accept;
-- HTTP/1.1 and layered `crypto/tls`;
+- HTTP/1.1, HTTP/2 (cleartext prior-knowledge via `UnencryptedHTTP2` and TLS-with-ALPN), and layered `crypto/tls`;
+- gRPC unary and server-streaming RPCs over both cleartext and TLS transports;
 - native VCL TLS (`DialTLS` / `ListenTLS`) via `VPPCOM_PROTO_TLS` with
   `vppcom_add_cert_key_pair` + `SET_CKPAIR`, sharing the same
   `net.Conn`/`net.Listener` surface as the plain TCP path;
@@ -124,7 +125,6 @@ Provisional or absent:
 - extended native TLS controls (SNI, ALPN, verify hooks via
   `SET_ENDPT_EXT_CFG`);
 - fd extraction;
-- HTTP/2 and gRPC validation.
 
 `ListenPacket` returns a `net.PacketConn` backed by a per-peer session adapter.
 VPP's UDP model creates a separate VLS session for each peer that contacts the

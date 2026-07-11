@@ -20,7 +20,8 @@ VCL worker.
 | Listener cancellation | `TCPListener.AcceptContext` distinguishes context expiry from listener or package close | Unit plus VPP integration |
 | Connected UDP | `Dial("udp*")`, read, write, and deadlines on IPv4 and IPv6 in Mode 3; Mode 2 fails before allocation with `EOPNOTSUPP` | VPP integration plus Mode 2 rejection tests |
 | Unconnected UDP (PacketConn) | `ListenPacket("udp*")` with per-peer session adapter; `ReadFrom` receives from any peer, `WriteTo` routes to known peers (those that have sent data). Mode 3 only | Unit tests plus VPP integration (echo round-trip with 3 messages) |
-| HTTP and layered TLS | HTTP/1.1 and standard `crypto/tls` over vclnet TCP | VPP integration |
+| HTTP and layered TLS | HTTP/1.1, HTTP/2 (cleartext prior-knowledge and TLS-with-ALPN), and standard `crypto/tls` over vclnet TCP | VPP integration (HTTP/1.1, HTTP/2 GET/POST + concurrent streams, HTTP/2 over ALPN-negotiated TLS) |
+| gRPC | Unary and server-streaming RPCs run over both cleartext and TLS transports on top of `vclnet.Listen` / `vclnet.DialContext`. Uses stock `grpc-go` with a `WithContextDialer` shim | VPP integration (`grpc-go` Health service, `Check` + `Watch`) |
 | Native VCL TLS | `DialTLS` / `ListenTLS` route TLS termination into VPP via `VPPCOM_PROTO_TLS` (OpenSSL engine, `vppcom_add_cert_key_pair` + `SET_CKPAIR`). No `crypto/tls` on the caller side | Unit config + VPP integration (echo, 128 KiB fragmentation, layered/native parity) |
 | Shutdown | Idempotent, tracks live listeners/conns/PacketConns/dials, drains listeners first, waits up to 5 s for in-flight I/O to finish, then force-closes stragglers and destroys the VCL app | Unit lifecycle registry + subprocess VPP concurrent-Shutdown stress |
 | VLS Mode 3 | Shared VCL worker with one persistent readiness poller | Default; standard and multi-VPP-worker harnesses |
@@ -86,10 +87,11 @@ The repository currently has 173 top-level no-VPP tests:
 
 VPP-backed coverage currently has:
 
-- 36 runnable public-package tests in the standard integration harness
+- 40 runnable public-package tests in the standard integration harness
   (including native VCL TLS, half-close, layered-TLS, deadline,
   Happy Eyeballs, shutdown, concurrent-shutdown stress, PacketConn echo,
-  connection-refused and TLS-refused cases, and address tests);
+  connection-refused and TLS-refused cases, address tests, HTTP/2
+  cleartext + TLS-with-ALPN, and gRPC cleartext + TLS);
 - 1 deliberately skipped test (half-close over cut-through transport);
 - 2 low-level vclpoll echo tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
@@ -97,12 +99,14 @@ VPP-backed coverage currently has:
 - 2 opt-in benchmarks.
 
 The standard harness exercises TCP IPv4 and IPv6, connected UDP IPv4 and IPv6,
-HTTP, layered TLS, native VCL TLS (short and 128 KiB fragmented echo plus a
-native-vs-layered parity test), Happy Eyeballs, context-aware accept,
-deadline expiry and updates, close-unblock behavior, simultaneous blocked
-read and write, PacketConn echo via per-peer session adapter, address
-reporting, shutdown, and TCP half-close (both `CloseWrite` peer-EOF and
-`CloseRead` local-EOF paths, plus parked-writer wake-up).
+HTTP/1.1, HTTP/2 (cleartext and TLS-with-ALPN), gRPC (cleartext and TLS,
+unary and server-streaming), layered TLS, native VCL TLS (short and 128 KiB
+fragmented echo plus a native-vs-layered parity test), Happy Eyeballs,
+context-aware accept, deadline expiry and updates, close-unblock behavior,
+simultaneous blocked read and write, PacketConn echo via per-peer session
+adapter, address reporting, shutdown, and TCP half-close (both
+`CloseWrite` peer-EOF and `CloseRead` local-EOF paths, plus parked-writer
+wake-up).
 
 Commands:
 
@@ -138,7 +142,7 @@ maintaining independent roadmaps.
 | ~~P1~~ | ~~Harden lifecycle and graceful drain~~ | ~~Done. `liveRegistry` tracks listeners, connections, PacketConns, and in-flight dials; `Shutdown`/`ShutdownWithTimeout` closes listeners first, waits up to a bounded drain window for tracked I/O to finish, then force-closes stragglers before destroying the VCL app. Subprocess integration stress covers concurrent Shutdown against active accepts, reads, writes, and dials.~~ |
 | P2 | Extended native TLS controls | Reach the rest of VPP's `TRANSPORT_ENDPT_EXT_CFG_CRYPTO` surface — SNI, ALPN, `verify_cfg`, `ca_trust_index`, `tls_profile_index` — via `VPPCOM_ATTR_SET_ENDPT_EXT_CFG`, and expose them on `TLSConfig` |
 | P2 | UDP edge semantics | Decide port-zero listeners, zero-length datagrams, truncation, connected `WriteTo`, multicast and broadcast, and source-address behavior |
-| P2 | Wider protocol validation | Add HTTP/2 and current gRPC integration tests before claiming those stacks are supported |
+| ~~P2~~ | ~~Wider protocol validation~~ | ~~Done. HTTP/2 (cleartext via `http.Server.Protocols`/`UnencryptedHTTP2` and TLS-with-ALPN) plus gRPC (cleartext and TLS, unary + server-streaming) run end-to-end over `vclnet.Listen`/`vclnet.DialContext` in the standard integration harness. Covered by `TestHTTP2CleartextOverVclnet`, `TestHTTP2TLSOverVclnet`, `TestGRPCOverVclnet`, and `TestGRPCTLSOverVclnet`.~~ |
 
 ## 4. Known limitations
 

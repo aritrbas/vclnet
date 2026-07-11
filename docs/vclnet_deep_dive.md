@@ -54,7 +54,7 @@ VPP (Vector Packet Processing) is a userspace networking stack that processes pa
 | Multi-NIC / multi-queue scaling via DPDK | Wire-speed for a Go HTTP server without per-conn kernel scheduler involvement |
 | One shared NIC across many tenant apps | Multi-tenant userspace dataplane (Calico-VPP, Envoy-on-VPP, etc.) |
 
-`vclnet` provides a viable explicit path for Go code that can accept a custom `net.Conn` or `net.Listener`. HTTP/1.1 is tested; HTTP/2 and current gRPC behavior still require dedicated integration coverage. The drop-in API:
+`vclnet` provides a viable explicit path for Go code that can accept a custom `net.Conn` or `net.Listener`. HTTP/1.1, HTTP/2 (cleartext and TLS-with-ALPN), and gRPC (unary and server-streaming, cleartext and TLS) are all covered by the integration harness. The drop-in API:
 
 ```go
 ln, _ := vclnet.Listen("tcp", ":8080")
@@ -1169,14 +1169,14 @@ Beyond the specific issues above, Frida itself is the wrong tool for this job. T
 | 1 | **Right abstraction boundary** | The intersection point between Go and VCL is `net.Conn`/`net.Listener`, not individual syscalls. vclnet draws the line exactly there. |
 | 2 | **Honours the VCL pthread contract** | Mode 3 pins each immediate call; Mode 2 executes every operation on a lifetime-pinned owner worker. |
 | 3 | **No fake FDs** | `vlsh` is an internal type (`vclpoll.VLSH` aliased to `int32`) that never escapes `internal/vclpoll`. The Go runtime poller never sees it; EBADF risk is structurally zero. |
-| 4 | **Standard Go errors** | `*net.OpError`, mutex-backed resettable deadlines, and `net.Error.Timeout()` semantics; layered TLS and HTTP/1.1 are tested. |
+| 4 | **Standard Go errors** | `*net.OpError`, mutex-backed resettable deadlines, and `net.Error.Timeout()` semantics; layered TLS, HTTP/1.1, HTTP/2, and gRPC are all integration-tested. |
 | 5 | **Zero hook maintenance** | No syscalls intercepted. Go version upgrades don't break the bridge. New Go syscall wrappers don't matter. |
 | 6 | **Native CGo ABI** | The Go ↔ C ABI is the supported, maintained path. CGo handles register conventions, stack switching, GC interaction. |
 | 7 | **Build-time linkage** | Linked against `libvppcom.so` at build time with rpath baked in. No runtime injection, no `LD_PRELOAD`, no agent. Deployable as a single binary + shared lib. |
 | 8 | **Supports goroutine concurrency** | Mode 3 is compatible but serialized; Mode 2 routes concurrent sessions across fixed owner workers. |
 | 9 | **Controlled initialization** | Calling `AppInit` once, early, avoids the unsafe in-hook initialization pattern seen in the prototype; it is a deployment requirement, not proof against every allocator interaction. |
 | 10 | **Cut-through-ready** | The vcl.conf already enables `app-scope-local`; vclnet's `vls_connect` / `vls_accept` exercise the CT transport path automatically when both peers are local. |
-| 11 | **Composable with existing libs** | Libraries that accept `net.Conn` can use vclnet; layered TLS and HTTP/1.1 are tested, while HTTP/2 and gRPC still need explicit validation. |
+| 11 | **Composable with existing libs** | Libraries that accept `net.Conn` can use vclnet; layered TLS, HTTP/1.1, HTTP/2 (`http.Server.Protocols` + `UnencryptedHTTP2`; TLS with ALPN=h2), and gRPC (unary + server-streaming, cleartext and TLS) all run end-to-end. |
 | 12 | **Debuggable** | Stack traces are pure Go + cgo + C. `delve` walks the Go side; `gdb` walks the C side. No JS layer. |
 | 13 | **MPTCP / new probes don't matter** | vclnet's `vls_create` is called with `VPPCOM_PROTO_TCP` directly. The kernel is never asked anything about MPTCP, so probes never fire. |
 | 14 | **No application busy-wait** | EAGAIN parks callers on Go channels while the selected Mode 3 or Mode 2 readiness loop drives MQ events. |
@@ -1375,9 +1375,9 @@ teardown, and fail-fast UDP rejection.
 It is not accurate to describe the library as production-complete. Mode 2 UDP
 is disabled pending a VPP cleanup fix, and Mode 2 still needs sustained
 supported-surface and teardown soak, CI history, and a reproducible performance
-baseline before it can become the default. HTTP/2, current gRPC, extended
-native TLS controls (SNI, ALPN, verify hooks via `SET_ENDPT_EXT_CFG`), and a
-VPP version matrix also remain open.
+baseline before it can become the default. Extended native TLS controls
+(SNI, ALPN, verify hooks via `SET_ENDPT_EXT_CFG`) and a VPP version matrix
+also remain open.
 
 The canonical prioritized list is
 [../summary.md](../summary.md#3-pending-work). It supersedes older roadmap

@@ -89,9 +89,10 @@ thread.
 
 The no-VPP suite has 173 top-level tests. The VPP-backed suites contain:
 
-- 36 runnable public-package single-worker tests (including native VCL TLS,
+- 40 runnable public-package single-worker tests (including native VCL TLS,
   half-close, layered TLS, deadline, PacketConn echo, Happy Eyeballs,
-  concurrent-Shutdown stress, and connection-refused/TLS-refused cases);
+  concurrent-Shutdown stress, connection-refused/TLS-refused cases,
+  HTTP/2 cleartext + TLS-ALPN, and gRPC cleartext + TLS);
 - 2 low-level VCL poll tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
   ownership and UDP-rejection invariant tests;
@@ -111,6 +112,10 @@ Covered behavior includes:
 - unconnected UDP (`ListenPacket`) with per-peer session adapter in Mode 3
   (3-message echo round-trip validated);
 - HTTP/1.1 requests, responses, keep-alive-configured requests, and the public client helper;
+- HTTP/2 over vclnet (cleartext prior-knowledge and TLS-with-ALPN,
+  including concurrent streams);
+- gRPC unary and server-streaming RPCs over both cleartext and TLS
+  transports (validated with `grpc-go`'s stock Health service);
 - standard `crypto/tls` over a VCL-backed connection;
 - native VCL TLS (`DialTLS`/`ListenTLS`) via VPP's OpenSSL engine with
   functional parity against layered `crypto/tls`;
@@ -133,7 +138,6 @@ The repository does not currently establish:
 - safe Mode 2 UDP in the pinned VPP build;
 - sustained full-surface and soak validation of VLS Mode 2;
 - clean-host packaging across supported distributions and VPP installs;
-- HTTP/2 or current gRPC interoperability;
 - extended native TLS controls (SNI matching, ALPN, verify hooks, session
   ticket policy, keylog) via `SET_ENDPT_EXT_CFG`;
 - a version range across VPP releases;
@@ -204,7 +208,7 @@ A production performance report should capture raw data for:
 | Lifecycle races | `liveRegistry` tracks listeners, conns, PacketConns, and in-flight dials; Shutdown closes listeners first, drains up to 5 s, then force-closes stragglers; concurrent-Shutdown stress covers active accepts/reads/writes/dials | Long-duration soak in CI |
 | Mode 2 rollout risk | Session-affine pool, ownership preflight, per-worker sharded listeners, dual-mode harness | Full-surface soak, CI history, and performance baseline |
 | Mode 2 cut-through UDP crash | UDP fails before VLS allocation; harness probes VPP after tests | Produce and report a minimal reproducer; enable only on a verified-safe VPP build |
-| Unsupported ecosystem assumptions | Docs now distinguish tested vs inferred | Add HTTP/2/gRPC/application-specific tests |
+| Unsupported ecosystem assumptions | Docs distinguish tested vs inferred; HTTP/2 and gRPC (unary + server-streaming, both cleartext and TLS) now covered in the standard integration harness | Continue expanding as new stacks are adopted |
 
 ## 8. Recommendation
 

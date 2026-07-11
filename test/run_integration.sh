@@ -29,7 +29,7 @@ require_vpp_paths
 CLI_SOCK=/tmp/vclnet-test/cli.sock
 APP_SOCK=/tmp/vclnet-test/app_ns_sockets/default
 VCL_CONF=/tmp/vclnet-share/vcl.conf
-TEST_FILTER="${1:-TestTCP|TestHTTP|TestUDP|TestTLS}"
+TEST_FILTER="${1:-TestTCP|TestHTTP|TestUDP|TestTLS|TestGRPC}"
 
 VPP_PID=""
 
