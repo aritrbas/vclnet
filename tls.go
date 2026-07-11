@@ -235,7 +235,10 @@ func ListenTLS(network, address string, cfg *TLSConfig) (net.Listener, error) {
 		return nil, opError("listen", network, address, err)
 	}
 	addr = addrFromInfo(info)
-	return newTCPListener(vlsh, addr, network), nil
+	ln := newTCPListener(vlsh, addr, network)
+	live.addListener(ln)
+	ln.tracked.Store(true)
+	return ln, nil
 }
 
 // DialTLS connects to a native VCL TLS endpoint. The returned connection
@@ -255,6 +258,8 @@ func DialTLSContext(ctx context.Context, network, address string, cfg *TLSConfig
 	if shutdownStarted.Load() {
 		return nil, opError("dial", network, address, ErrClosed)
 	}
+	endDial := live.beginDial()
+	defer endDial()
 	if err := cfg.validate(false); err != nil {
 		return nil, opError("dial", network, address, err)
 	}
@@ -308,6 +313,8 @@ func DialTLSContext(ctx context.Context, network, address string, cfg *TLSConfig
 
 	conn := newTCPConn(vlsh)
 	conn.peerAddr = addr
+	live.addConn(conn)
+	conn.tracked.Store(true)
 	return conn, nil
 }
 

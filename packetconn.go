@@ -24,6 +24,7 @@ type packetConn struct {
 
 	closed    atomic.Bool
 	closeOnce sync.Once
+	tracked   atomic.Bool
 	stopCh    chan struct{}
 	wg        sync.WaitGroup
 
@@ -247,6 +248,9 @@ func (pc *packetConn) Close() error {
 
 		if !shutdownStarted.Load() {
 			closeErr = vclpoll.Close(pc.listenerVLSH)
+		}
+		if pc.tracked.Load() {
+			live.removePacketConn(pc)
 		}
 	})
 	if closeErr != nil {

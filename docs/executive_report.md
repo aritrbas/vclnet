@@ -87,11 +87,11 @@ thread.
 
 ## 3. Current evidence
 
-The no-VPP suite has 165 top-level tests. The VPP-backed suites contain:
+The no-VPP suite has 173 top-level tests. The VPP-backed suites contain:
 
-- 33 runnable public-package single-worker tests (including native VCL TLS,
-  half-close, layered TLS, deadline, PacketConn echo, and Happy Eyeballs
-  tests);
+- 34 runnable public-package single-worker tests (including native VCL TLS,
+  half-close, layered TLS, deadline, PacketConn echo, Happy Eyeballs, and
+  concurrent-Shutdown stress);
 - 2 low-level VCL poll tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
   ownership and UDP-rejection invariant tests;
@@ -197,7 +197,7 @@ A production performance report should capture raw data for:
 | VPP API/behavior drift | Integration harness exercises local VPP | P0 automated version matrix |
 | Unconnected UDP limitation | Per-peer session adapter implemented; `WriteTo` only reaches known peers | Document or mitigate the no-originate-session VPP constraint |
 | Connect failure ambiguity | Immediate hard failures are wrapped | Add reliable post-EPOLLOUT error query/tests |
-| Lifecycle races | Shutdown gates new work and wakes dispatcher waits | Track/drain all live objects and soak test |
+| Lifecycle races | `liveRegistry` tracks listeners, conns, PacketConns, and in-flight dials; Shutdown closes listeners first, drains up to 5 s, then force-closes stragglers; concurrent-Shutdown stress covers active accepts/reads/writes/dials | Long-duration soak in CI |
 | Mode 2 rollout risk | Session-affine pool, ownership preflight, per-worker sharded listeners, dual-mode harness | Full-surface soak, CI history, and performance baseline |
 | Mode 2 cut-through UDP crash | UDP fails before VLS allocation; harness probes VPP after tests | Produce and report a minimal reproducer; enable only on a verified-safe VPP build |
 | Unsupported ecosystem assumptions | Docs now distinguish tested vs inferred | Add HTTP/2/gRPC/application-specific tests |
@@ -222,4 +222,4 @@ build, runs the same integration suite, and accepts the documented limitations.
 
 ---
 
-Document status: audited 2026-07-09.
+Document status: audited 2026-07-10.

@@ -18,6 +18,7 @@ type tcpListener struct {
 
 	closed    atomic.Bool
 	closeOnce sync.Once
+	tracked   atomic.Bool
 	doneCh    chan struct{}
 }
 
@@ -65,6 +66,8 @@ func (l *tcpListener) AcceptContext(ctx context.Context) (net.Conn, error) {
 
 	conn := newTCPConn(connVLSH)
 	conn.peerAddr = addrFromInfo(peerInfo)
+	live.addConn(conn)
+	conn.tracked.Store(true)
 	return conn, nil
 }
 
@@ -76,6 +79,9 @@ func (l *tcpListener) Close() error {
 		close(l.doneCh)
 		if !shutdownStarted.Load() {
 			err = vclpoll.Close(l.vlsh)
+		}
+		if l.tracked.Load() {
+			live.removeListener(l)
 		}
 	})
 	if err != nil {

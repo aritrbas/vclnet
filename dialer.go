@@ -72,6 +72,9 @@ func (d *Dialer) dialTCP(ctx context.Context, network, address string) (net.Conn
 }
 
 func (d *Dialer) dialSingleTCP(ctx context.Context, network, address string, addr *net.TCPAddr) (net.Conn, error) {
+	endDial := live.beginDial()
+	defer endDial()
+
 	vlsh, immediate, err := connectStart(addr)
 	if err != nil {
 		return nil, opError("dial", network, address, err)
@@ -96,6 +99,8 @@ func (d *Dialer) dialSingleTCP(ctx context.Context, network, address string, add
 
 	conn := newTCPConn(vlsh)
 	conn.peerAddr = addr
+	live.addConn(conn)
+	conn.tracked.Store(true)
 	return conn, nil
 }
 
@@ -181,6 +186,9 @@ func interruptedConnectError(ctx context.Context) error {
 }
 
 func (d *Dialer) dialUDP(ctx context.Context, network, address string) (net.Conn, error) {
+	endDial := live.beginDial()
+	defer endDial()
+
 	addr, err := resolveUDPAddr(ctx, network, address)
 	if err != nil {
 		return nil, opError("dial", network, address, err)
@@ -207,6 +215,8 @@ func (d *Dialer) dialUDP(ctx context.Context, network, address string) (net.Conn
 
 	conn := newUDPConn(vlsh, nil, true)
 	conn.peerAddr = addr
+	live.addConn(conn)
+	conn.tracked.Store(true)
 	return conn, nil
 }
 

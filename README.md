@@ -277,6 +277,7 @@ var ErrTLSPartialCert error
 var ErrUnknownPeer error // WriteTo to address not seen via ReadFrom
 
 func Shutdown()
+func ShutdownWithTimeout(drainTimeout time.Duration)
 func ShutdownDone() <-chan struct{}
 func InstallSignalHandler()
 
@@ -285,9 +286,14 @@ func IsConnectionRefused(err error) bool
 func IsConnectionReset(err error) bool
 ```
 
-`Shutdown` is idempotent, wakes dispatcher-backed accepts and I/O, and makes new
-public operations fail with `ErrClosed`. Applications should still stop
-admitting work before shutdown.
+`Shutdown` is idempotent. It closes every tracked listener first (stopping
+new accepts), waits up to a bounded drain window (5 s by default) for
+tracked connections, PacketConns, and in-flight dials to finish naturally,
+then force-closes any stragglers so blocked reads/writes unpark with
+`ErrClosed`. Use `ShutdownWithTimeout(d)` for an explicit drain window;
+zero waits indefinitely, negative skips the drain entirely. Applications
+should still stop admitting new work at the application layer (drain HTTP
+handlers, refuse new RPCs) before calling Shutdown.
 
 ## Build and runtime requirements
 
@@ -404,10 +410,11 @@ by `test/env.sh` — see that file for the full list.
 
 Current top-level coverage consists of:
 
-- 165 no-VPP tests across the public package, Mode 3 poller, Mode 2 workers,
-  and sharded listeners;
-- 33 runnable public-package single-worker integration tests, plus one
-  deliberately skipped test (half-close over cut-through);
+- 173 no-VPP tests across the public package, lifecycle registry, Mode 3
+  poller, Mode 2 workers, and sharded listeners;
+- 34 runnable public-package single-worker integration tests (including a
+  concurrent-Shutdown stress test), plus one deliberately skipped test
+  (half-close over cut-through);
 - 2 low-level VCL poll integration tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
   invariants for ownership and safe UDP rejection;

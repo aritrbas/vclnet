@@ -73,7 +73,8 @@ repository has completed every production-hardening item.
 | udpconn.go      connected UDP net.Conn                         |
 | packetconn.go   per-peer session adapter for net.PacketConn    |
 | transport.go    HTTP transport/client                          |
-| shutdown.go     package lifecycle                              |
+| shutdown.go     package lifecycle and graceful drain           |
+| lifecycle.go    live listener/conn/PacketConn/dial registry    |
 | addr/errors.go  resolver and net.OpError adaptation            |
 +-------------------------------+-------------------------------+
                                 |
@@ -320,14 +321,30 @@ listener close.
 
 ## 10. Shutdown
 
-`Shutdown` is idempotent and process-final:
+`Shutdown` is idempotent and process-final. It uses a package-level
+`liveRegistry` (`lifecycle.go`) to track open listeners, connections,
+PacketConns, and in-flight dials:
 
 ```text
 mark public package closed
+  -> close every tracked listener (stops admitting new work; wakes AcceptContext)
+  -> wait up to the drain window (5 s default) for tracked conns/PacketConns/dials
+       to finish naturally — waitDrain wakes on the last removal
+  -> force-close remaining tracked conns and PacketConns so parked reads/writes
+     unpark with ErrClosed
   -> prevent parked operations from re-entering VLS
   -> stop the active dispatcher and wake exact waiters
   -> destroy the VCL application after readiness workers stop
 ```
+
+`ShutdownWithTimeout(d)` exposes the drain window explicitly. Zero waits
+indefinitely; negative skips the drain and force-closes immediately.
+
+Every public entry point (`Listen`, `ListenTLS`, `ListenPacket`,
+`AcceptContext`, `Dial`, `DialTLSContext`) registers its result before
+returning; each object's `Close` unregisters. In-flight dials are counted
+separately so Shutdown does not race a connect that has completed the VLS
+work but not yet handed the conn back to the caller.
 
 Mode 3 stops its shared poller before app destruction. Mode 2 marks the pool
 stopping, closes every worker stop channel, wakes waiters, closes sessions on
@@ -336,8 +353,9 @@ non-bootstrap OS thread to disappear before worker 0 destroys the app. The
 bootstrap M is then parked because the pinned VPP pthread destructor is unsafe
 after global VLS state is gone.
 
-A full public connection registry and application-level graceful drain policy
-remain pending. Services should stop admitting work and drain handlers first.
+Applications should still stop admitting new work at the application layer
+(drain HTTP handlers, refuse new RPCs) before calling Shutdown; the drain
+window catches whatever is already in flight.
 
 ## 11. VLS modes and multi-worker VPP
 

@@ -101,6 +101,10 @@ type tcpConn struct {
 
 	closed    atomic.Bool
 	closeOnce sync.Once
+	// tracked records whether this conn was registered with the lifecycle
+	// registry. Tests that construct bare tcpConn via newTCPConn(0) skip
+	// registration, so Close must not attempt to unregister them.
+	tracked atomic.Bool
 
 	// readShutdown and writeShutdown record half-close state independently
 	// of closed. vls_shutdown does not emit an epoll event for a locally
@@ -291,6 +295,9 @@ func (c *tcpConn) Close() error {
 		c.writeDeadline.interrupt()
 		if !shutdownStarted.Load() {
 			err = vclpoll.Close(c.vlsh)
+		}
+		if c.tracked.Load() {
+			live.removeConn(c)
 		}
 	})
 	if err != nil {

@@ -785,6 +785,15 @@ destruction. Worker 0 is parked afterward because its pthread VLS destructor
 is unsafe once global VLS state has been destroyed. Reinitialization is not
 supported.
 
+At the public-API layer, `Shutdown` (see `vclnet/shutdown.go` and
+`vclnet/lifecycle.go`) first uses a package-level `liveRegistry` to close
+every tracked listener, then waits up to a bounded drain window (5 s by
+default; `ShutdownWithTimeout(d)` for explicit control) for tracked
+connections, PacketConns, and in-flight dials to finish. Anything still
+tracked when the window elapses is force-closed so blocked reads/writes
+unpark with `ErrClosed` before the dispatcher is stopped and
+`vppcom_app_destroy` runs.
+
 ## 12. Non-Blocking I/O and Readiness Dispatch
 
 Every session is non-blocking. VLS read, write, accept, and connect operations
@@ -1399,7 +1408,8 @@ This enables the session layer and the SEQPACKET app-socket-api endpoint.
 | `vclnet/udpconn.go` | `udpConn` (`net.Conn`) — connected UDP is validated in Mode 3 |
 | `vclnet/packetconn.go` | `packetConn` (`net.PacketConn`) — per-peer session adapter for unconnected UDP |
 | `vclnet/listener.go` | `tcpListener` (`net.Listener` with `AcceptContext`) — Accept/Close/doneCh |
-| `vclnet/shutdown.go` | `Shutdown()`, `ShutdownDone()`, `InstallSignalHandler()` |
+| `vclnet/shutdown.go` | `Shutdown()`, `ShutdownWithTimeout()`, `ShutdownDone()`, `InstallSignalHandler()` |
+| `vclnet/lifecycle.go` | `liveRegistry` — tracks open listeners, conns, PacketConns, and in-flight dials for graceful drain |
 | `vclnet/transport.go` | `Transport()`, `DefaultTransport`, `NewHTTPClient()` — HTTP connection pooling |
 | `vclnet/addr.go` | Network parsing, DNS resolution, `resolveAddrs`, `resolveUDPAddr`, `isUDP` |
 | `vclnet/errors.go` | `*net.OpError` wrapping, `IsTimeout`, `IsConnectionRefused`, `IsConnectionReset` |

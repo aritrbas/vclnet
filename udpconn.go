@@ -26,6 +26,7 @@ type udpConn struct {
 
 	closed    atomic.Bool
 	closeOnce sync.Once
+	tracked   atomic.Bool
 
 	readDeadline  *deadlineState
 	writeDeadline *deadlineState
@@ -199,6 +200,9 @@ func (c *udpConn) Close() error {
 		c.writeDeadline.interrupt()
 		if !shutdownStarted.Load() {
 			err = vclpoll.Close(c.vlsh)
+		}
+		if c.tracked.Load() {
+			live.removeConn(c)
 		}
 	})
 	if err != nil {

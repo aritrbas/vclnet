@@ -149,7 +149,10 @@ func Listen(network, address string) (net.Listener, error) {
 		return nil, opError("listen", network, address, err)
 	}
 	addr = addrFromInfo(info)
-	return newTCPListener(vlsh, addr, network), nil
+	ln := newTCPListener(vlsh, addr, network)
+	live.addListener(ln)
+	ln.tracked.Store(true)
+	return ln, nil
 }
 
 // ListenPacket creates a UDP PacketConn backed by VPP's session-based UDP
@@ -224,7 +227,10 @@ func ListenPacket(network, address string) (net.PacketConn, error) {
 		return nil, opError("listen", network, address, err)
 	}
 	addr = udpAddrFromInfo(info)
-	return newPacketConn(vlsh, addr), nil
+	pc := newPacketConn(vlsh, addr)
+	live.addPacketConn(pc)
+	pc.tracked.Store(true)
+	return pc, nil
 }
 
 // DialContext connects to the address on the named network, respecting the

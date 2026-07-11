@@ -124,6 +124,8 @@ func runServerChild() {
 		runUDPClient(port, nConns)
 	case "shutdown":
 		runShutdownSelfTest(port)
+	case "shutdown_stress":
+		runShutdownStressSelfTest(port)
 	case "halfclose":
 		runHalfCloseServer(port)
 	default:
@@ -196,6 +198,117 @@ func runShutdownSelfTest(port int) {
 	}
 	fmt.Printf("READY %d\n", port)
 	os.Stdout.Sync()
+}
+
+// runShutdownStressSelfTest concurrently drives listen, accept, read, write,
+// and dial across two VCL apps that share this single VPP: the child process
+// hosts a small server and, in a separate goroutine, dials itself through
+// its own listener would deadlock (VPP rejects loopback within an app), so
+// dials target the peer app (the driving parent test), which points its own
+// listener at a well-known ephemeral port. Once all workloads are in flight
+// the child calls Shutdown(); the invariant is that every worker goroutine
+// returns and does not deadlock or panic within the drain window.
+func runShutdownStressSelfTest(port int) {
+	// Small server on the child listener.
+	ln, err := vclnet.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "child: stress Listen: %v\n", err)
+		os.Exit(2)
+	}
+
+	var wg sync.WaitGroup
+
+	// Accept goroutines: block on Accept until Shutdown wakes them.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				// Echo one small buffer and keep the conn open so an
+				// active Read/Write races with Shutdown.
+				wg.Add(1)
+				go func(c net.Conn) {
+					defer wg.Done()
+					defer c.Close()
+					buf := make([]byte, 4096)
+					for {
+						n, rerr := c.Read(buf)
+						if n > 0 {
+							if _, werr := c.Write(buf[:n]); werr != nil {
+								return
+							}
+						}
+						if rerr != nil {
+							return
+						}
+					}
+				}(c)
+			}
+		}()
+	}
+
+	// Dial goroutines: continuously try to open new conns to the peer
+	// (parent-side) listener while Shutdown is in progress. All must return
+	// ErrClosed or a wrapped context error rather than blocking forever.
+	peerPort := port + 1
+	peerAddr := fmt.Sprintf("127.0.0.1:%d", peerPort)
+	dialStop := make(chan struct{})
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-dialStop:
+					return
+				default:
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+				c, err := vclnet.DialContext(ctx, "tcp4", peerAddr)
+				cancel()
+				if err == nil {
+					_ = c.Close()
+				}
+			}
+		}()
+	}
+
+	fmt.Printf("READY %d\n", port)
+	os.Stdout.Sync()
+
+	// Let workloads warm up.
+	time.Sleep(200 * time.Millisecond)
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		vclnet.Shutdown()
+	}()
+
+	select {
+	case <-shutdownDone:
+	case <-time.After(15 * time.Second):
+		fmt.Fprintln(os.Stderr, "child: Shutdown did not complete within 15s")
+		os.Exit(2)
+	}
+
+	close(dialStop)
+
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+	select {
+	case <-waitCh:
+	case <-time.After(10 * time.Second):
+		fmt.Fprintln(os.Stderr, "child: worker goroutines did not exit after Shutdown")
+		os.Exit(2)
+	}
 }
 
 // runHalfCloseServer validates CloseWrite over the wire: the client sends
@@ -2427,6 +2540,17 @@ func TestTCPHappyEyeballsLocalhost(t *testing.T) {
 func TestTCPShutdownWakesAccept(t *testing.T) {
 	skipIfNoVPP(t)
 	cmd, _, stderr := startServer(t, "shutdown", 0)
+	defer cmd.Process.Kill()
+	waitOrKill(t, cmd, stderr)
+}
+
+// TestTCPShutdownConcurrentIO stresses graceful drain under load: while the
+// child hosts a listener and multiple accept/read/write/dial goroutines are
+// active, it invokes Shutdown. The child fails the run if Shutdown does not
+// complete within the drain window or if worker goroutines fail to exit.
+func TestTCPShutdownConcurrentIO(t *testing.T) {
+	skipIfNoVPP(t)
+	cmd, _, stderr := startServer(t, "shutdown_stress", 0)
 	defer cmd.Process.Kill()
 	waitOrKill(t, cmd, stderr)
 }

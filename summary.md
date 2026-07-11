@@ -1,6 +1,6 @@
 # vclnet implementation summary
 
-Last audited: 2026-07-09
+Last audited: 2026-07-10
 
 ## 1. What works today
 
@@ -22,7 +22,7 @@ VCL worker.
 | Unconnected UDP (PacketConn) | `ListenPacket("udp*")` with per-peer session adapter; `ReadFrom` receives from any peer, `WriteTo` routes to known peers (those that have sent data). Mode 3 only | Unit tests plus VPP integration (echo round-trip with 3 messages) |
 | HTTP and layered TLS | HTTP/1.1 and standard `crypto/tls` over vclnet TCP | VPP integration |
 | Native VCL TLS | `DialTLS` / `ListenTLS` route TLS termination into VPP via `VPPCOM_PROTO_TLS` (OpenSSL engine, `vppcom_add_cert_key_pair` + `SET_CKPAIR`). No `crypto/tls` on the caller side | Unit config + VPP integration (echo, 128 KiB fragmentation, layered/native parity) |
-| Shutdown | Idempotent, wakes parked operations, stops VLS workers, and rejects later operations | Unit and subprocess VPP integration |
+| Shutdown | Idempotent, tracks live listeners/conns/PacketConns/dials, drains listeners first, waits up to 5 s for in-flight I/O to finish, then force-closes stragglers and destroys the VCL app | Unit lifecycle registry + subprocess VPP concurrent-Shutdown stress |
 | VLS Mode 3 | Shared VCL worker with one persistent readiness poller | Default; standard and multi-VPP-worker harnesses |
 | VLS Mode 2 | N pinned VCL workers, per-worker epoll, virtual process-wide handles, ownership preflight, per-worker sharded listeners with accept fan-in, and no shared poller; TCP only for the pinned VPP build | Opt-in; unit tests and multi-worker TCP, IPv6, HTTP, sharded-accept scaling, ownership, and UDP-rejection stress |
 
@@ -71,11 +71,13 @@ gaps remain release blockers:
 
 ## 2. Test inventory
 
-The repository currently has 165 top-level no-VPP tests:
+The repository currently has 173 top-level no-VPP tests:
 
 - 135 public-package contract and unit tests (including native VCL TLS
   contract tests, PacketConn per-peer adapter tests, and connected UDP
   error-handling tests);
+- 8 lifecycle registry tests (add/remove, wait-drain wake-up, timeout,
+  concurrent add/remove, and snapshot stability);
 - 9 shared Mode 3 poller tests;
 - 11 Mode 2 worker, ownership, parking, UDP rejection, and shutdown tests;
 - 7 sharded listener tests (per-worker creation, accept fan-in, context
@@ -84,9 +86,10 @@ The repository currently has 165 top-level no-VPP tests:
 
 VPP-backed coverage currently has:
 
-- 33 runnable public-package tests in the standard integration harness
+- 34 runnable public-package tests in the standard integration harness
   (including native VCL TLS, half-close, layered-TLS, deadline,
-  Happy Eyeballs, shutdown, PacketConn echo, and address tests);
+  Happy Eyeballs, shutdown, concurrent-shutdown stress, PacketConn echo,
+  and address tests);
 - 1 deliberately skipped test (half-close over cut-through transport);
 - 2 low-level vclpoll echo tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
@@ -132,7 +135,7 @@ maintaining independent roadmaps.
 | ~~P1~~ | ~~Decide the unconnected UDP contract~~ | ~~Done. Per-peer session adapter: background accept loop + per-peer readers fan into ReadFrom; WriteTo routes to known peers. Integration test enabled~~ |
 | P1 | Verify asynchronous connect completion errors | Replace the EPOLLOUT-implies-success assumption when VPP exposes a reliable session error query, and add refused and unreachable integration cases |
 | P1 | Establish reproducible performance baselines | Record topology, hardware, VPP and kernel configs, payload and concurrency distributions, raw benchmark output, and comparisons before publishing speedup claims |
-| P1 | Harden lifecycle and graceful drain | Track live listeners and connections, define graceful-drain ordering, and stress concurrent Shutdown with active reads, writes, accepts, and dials |
+| ~~P1~~ | ~~Harden lifecycle and graceful drain~~ | ~~Done. `liveRegistry` tracks listeners, connections, PacketConns, and in-flight dials; `Shutdown`/`ShutdownWithTimeout` closes listeners first, waits up to a bounded drain window for tracked I/O to finish, then force-closes stragglers before destroying the VCL app. Subprocess integration stress covers concurrent Shutdown against active accepts, reads, writes, and dials.~~ |
 | P2 | Extended native TLS controls | Reach the rest of VPP's `TRANSPORT_ENDPT_EXT_CFG_CRYPTO` surface — SNI, ALPN, `verify_cfg`, `ca_trust_index`, `tls_profile_index` — via `VPPCOM_ATTR_SET_ENDPT_EXT_CFG`, and expose them on `TLSConfig` |
 | P2 | UDP edge semantics | Decide port-zero listeners, zero-length datagrams, truncation, connected `WriteTo`, multicast and broadcast, and source-address behavior |
 | P2 | Wider protocol validation | Add HTTP/2 and current gRPC integration tests before claiming those stacks are supported |
@@ -240,15 +243,30 @@ VCL negative return values become `VCLError` values containing
 `syscall.Errno`. Public operations wrap them in `*net.OpError`, preserving
 `errors.Is` checks such as `ECONNREFUSED`, `ECONNRESET`, and `ETIMEDOUT`.
 
-`Shutdown`:
+`Shutdown` (and its explicit-timeout form `ShutdownWithTimeout(d)`):
 
 1. marks the package closed so new public operations fail;
-2. prevents parked operations from re-entering VLS;
-3. stops the active dispatcher and wakes its exact waiters;
-4. in Mode 2, closes sessions on their owners, drains worker MQ cleanup, and
+2. closes every tracked listener (stops accepting new work at the process
+   boundary and wakes blocked `AcceptContext` callers);
+3. waits up to the drain window (5 s by default) for tracked connections,
+   PacketConns, and in-flight dials to finish naturally;
+4. force-closes any remaining tracked conns and PacketConns after the drain
+   window elapses, so blocked reads/writes unpark with `ErrClosed`;
+5. prevents parked operations from re-entering VLS;
+6. stops the active dispatcher and wakes its exact waiters;
+7. in Mode 2, closes sessions on their owners, drains worker MQ cleanup, and
    waits for non-bootstrap worker threads to exit;
-5. calls `vppcom_app_destroy` only after the active readiness machinery has
+8. calls `vppcom_app_destroy` only after the active readiness machinery has
    stopped.
 
-Shutdown is idempotent and process-final. Services should stop admitting work
-and allow handlers to drain before calling it.
+`liveRegistry` (internal, `lifecycle.go`) is the tracking mechanism. Every
+`Listen`, `ListenTLS`, `ListenPacket`, `AcceptContext`, `Dial`, and
+`DialTLSContext` call registers its result before returning; each object's
+`Close` unregisters. In-flight dials are counted independently so Shutdown
+does not race a connect that has completed the VLS work but not yet handed
+the conn back to the caller.
+
+Shutdown is idempotent and process-final. Services should still stop
+admitting new work at the application layer (drain HTTP handlers, refuse new
+RPCs) before calling Shutdown; the drain window catches whatever is already
+in flight.
