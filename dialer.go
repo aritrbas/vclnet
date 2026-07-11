@@ -81,10 +81,22 @@ func (d *Dialer) dialSingleTCP(ctx context.Context, network, address string, add
 	}
 
 	if !immediate {
-		ok := vclpoll.PollWaitContext(vlsh, 0x004, ctx.Done()) // EPOLLOUT
+		// Wait on the union of EPOLLOUT (write-ready = connect completed
+		// successfully) and EPOLLERR|EPOLLHUP (connect failed). Both wake
+		// the same waiter; sessionConnectError disambiguates.
+		ok := vclpoll.PollWaitContext(vlsh, connectReadyEvents, ctx.Done())
 		if !ok {
 			vclpoll.CloseVLSH(vlsh)
 			return nil, opError("dial", network, address, interruptedConnectError(ctx))
+		}
+		// EPOLLOUT alone does not mean the connect succeeded — a refused
+		// SYN or unreachable route still surfaces via
+		// SESSION_CTRL_EVT_CONNECTED with a non-zero retval. Query VPP
+		// for the session's post-connect error before handing the vlsh
+		// back to the caller.
+		if err := vclpoll.SessionConnectError(vlsh); err != nil {
+			vclpoll.CloseVLSH(vlsh)
+			return nil, opError("dial", network, address, err)
 		}
 	}
 
@@ -103,6 +115,13 @@ func (d *Dialer) dialSingleTCP(ctx context.Context, network, address string, add
 	conn.tracked.Store(true)
 	return conn, nil
 }
+
+// connectReadyEvents is the epoll event mask a connect waits on. EPOLLOUT
+// fires on successful handshake; EPOLLERR / EPOLLHUP fire on refused,
+// unreachable, and other terminal failures. VPP delivers both through the
+// same session-event path, so waiting on their union lets one waiter cover
+// both outcomes; sessionConnectError() then disambiguates.
+const connectReadyEvents = 0x004 | 0x008 | 0x010 // EPOLLOUT | EPOLLERR | EPOLLHUP
 
 // dialHappyEyeballs implements RFC 6555/8305 for concurrent dual-stack connect.
 func (d *Dialer) dialHappyEyeballs(ctx context.Context, network, address string, addrs []*net.TCPAddr) (net.Conn, error) {
@@ -199,9 +218,13 @@ func (d *Dialer) dialUDP(ctx context.Context, network, address string) (net.Conn
 		return nil, opError("dial", network, address, err)
 	}
 	if !immediate {
-		if ok := vclpoll.PollWaitContext(vlsh, 0x004, ctx.Done()); !ok {
+		if ok := vclpoll.PollWaitContext(vlsh, connectReadyEvents, ctx.Done()); !ok {
 			vclpoll.CloseVLSH(vlsh)
 			return nil, opError("dial", network, address, interruptedConnectError(ctx))
+		}
+		if err := vclpoll.SessionConnectError(vlsh); err != nil {
+			vclpoll.CloseVLSH(vlsh)
+			return nil, opError("dial", network, address, err)
 		}
 	}
 	if err := ctx.Err(); err != nil {

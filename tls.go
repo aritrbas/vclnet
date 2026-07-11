@@ -295,11 +295,17 @@ func DialTLSContext(ctx context.Context, network, address string, cfg *TLSConfig
 	if !immediate {
 		// The wait covers the TLS handshake — VPP does not signal EPOLLOUT
 		// until the negotiated session is fully ready for application
-		// data.  On a slow handshake this is where the caller's context
-		// deadline actually kicks in.
-		if ok := vclpoll.PollWaitContext(vlsh, 0x004, ctx.Done()); !ok {
+		// data. On a slow handshake this is where the caller's context
+		// deadline actually kicks in. The union with EPOLLERR/EPOLLHUP
+		// lets a refused / unreachable / TLS-handshake-failed outcome
+		// wake the same waiter; sessionConnectError disambiguates.
+		if ok := vclpoll.PollWaitContext(vlsh, connectReadyEvents, ctx.Done()); !ok {
 			vclpoll.CloseVLSH(vlsh)
 			return nil, opError("dial", network, address, interruptedConnectError(ctx))
+		}
+		if err := vclpoll.SessionConnectError(vlsh); err != nil {
+			vclpoll.CloseVLSH(vlsh)
+			return nil, opError("dial", network, address, err)
 		}
 	}
 	if err := ctx.Err(); err != nil {

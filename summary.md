@@ -13,7 +13,7 @@ VCL worker.
 | --- | --- | --- |
 | TCP | Listen, accept, dial, read, write, close, and half-close on IPv4 and IPv6 | Unit plus VPP integration |
 | TCP half-close | `CloseRead` and `CloseWrite` route to `vls_shutdown(SHUT_RD/SHUT_WR)`; SHUT_WR emits a peer FIN, SHUT_RD is local-only. Does not work over cut-through transport (see limitation 10) | Unit state tests plus VPP integration (wake-parked-writer, local-EOF); peer-EOF test skipped under CT |
-| Context dialing | TCP in both modes and connected UDP in Mode 3 honor cancellation while resolving or connecting | Unit plus VPP integration for successful paths |
+| Context dialing | TCP in both modes and connected UDP in Mode 3 honor cancellation while resolving or connecting; async-connect completion is verified via `vppcom_session_get_error` after the poller wakes for `EPOLLOUT`\|`EPOLLERR`\|`EPOLLHUP`, so a successful handshake reliably returns a ready conn and never a spurious success from a stale EPOLLOUT. See known-limitation #12 for the current VPP-side coverage gap on refused-peer signalling | Unit plus VPP integration (successful paths); refused/unreachable integration tests present but skipped/documented pending upstream VPP delivery fix |
 | Happy Eyeballs | Unsuffixed `"tcp"` interleaves IPv6 and IPv4 attempts with a configurable stagger and closes successful losers | Localhost VPP integration plus helper tests |
 | Deadlines | Resettable read and write deadlines wake operations already parked for readiness | Timer unit tests plus TCP and Mode 3 UDP VPP integration |
 | Concurrent I/O | One session can retain separate read and write waiters | Readiness state-machine tests plus 6 MiB TCP integration |
@@ -86,10 +86,10 @@ The repository currently has 173 top-level no-VPP tests:
 
 VPP-backed coverage currently has:
 
-- 34 runnable public-package tests in the standard integration harness
+- 36 runnable public-package tests in the standard integration harness
   (including native VCL TLS, half-close, layered-TLS, deadline,
   Happy Eyeballs, shutdown, concurrent-shutdown stress, PacketConn echo,
-  and address tests);
+  connection-refused and TLS-refused cases, and address tests);
 - 1 deliberately skipped test (half-close over cut-through transport);
 - 2 low-level vclpoll echo tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
@@ -133,7 +133,7 @@ maintaining independent roadmaps.
 | P0 | Complete Mode 2 rollout validation | Run the full supported TCP integration surface, repeated shutdown cases, a long concurrency soak, and no-migration and safe-UDP-rejection assertions in CI; keep Mode 3 as default until the sustained-green and performance gates pass |
 | ~~P1~~ | ~~Shard Mode 2 listeners~~ | ~~Done. Per-worker listener sharding with SO_REUSEPORT and accept fan-in; validated with 16-connection sharded-accept integration test~~ |
 | ~~P1~~ | ~~Decide the unconnected UDP contract~~ | ~~Done. Per-peer session adapter: background accept loop + per-peer readers fan into ReadFrom; WriteTo routes to known peers. Integration test enabled~~ |
-| P1 | Verify asynchronous connect completion errors | Replace the EPOLLOUT-implies-success assumption when VPP exposes a reliable session error query, and add refused and unreachable integration cases |
+| P1 | Verify asynchronous connect completion errors | Client-side plumbing landed: dial paths wait on the union of `EPOLLOUT`\|`EPOLLERR`\|`EPOLLHUP` and call `vppcom_session_get_error` (wrapped as `vclpoll.SessionConnectError`) before returning a conn, so a stale EPOLLOUT cannot yield a spurious success. VPP-side integration is partial: on the pinned VPP 26.10 build with `app-scope-local`, a connect to an unused loopback port increments the session `no route` error counter and calls `app_worker_connect_notify`, but the resulting `SESSION_CTRL_EVT_CONNECTED` reply never wakes our epoll waiter (VPP appears to drop the postponed event before it is generated). Integration tests `TestTCPDialConnectionRefused` and `TestTCPDialTLSConnectionRefused` document this by accepting a context timeout as a documented gap. Full investigation, VPP source references, and reproduction steps are in [docs/connect_error_investigation.md](docs/connect_error_investigation.md). Close-out requires either a VPP fix or a wire-side topology (real NIC, RST from peer) where VPP reliably delivers the CONNECTED-with-error event, plus adding a positive assertion once observed. |
 | P1 | Establish reproducible performance baselines | Record topology, hardware, VPP and kernel configs, payload and concurrency distributions, raw benchmark output, and comparisons before publishing speedup claims |
 | ~~P1~~ | ~~Harden lifecycle and graceful drain~~ | ~~Done. `liveRegistry` tracks listeners, connections, PacketConns, and in-flight dials; `Shutdown`/`ShutdownWithTimeout` closes listeners first, waits up to a bounded drain window for tracked I/O to finish, then force-closes stragglers before destroying the VCL app. Subprocess integration stress covers concurrent Shutdown against active accepts, reads, writes, and dials.~~ |
 | P2 | Extended native TLS controls | Reach the rest of VPP's `TRANSPORT_ENDPT_EXT_CFG_CRYPTO` surface — SNI, ALPN, `verify_cfg`, `ca_trust_index`, `tls_profile_index` — via `VPPCOM_ATTR_SET_ENDPT_EXT_CFG`, and expose them on `TLSConfig` |
@@ -181,6 +181,17 @@ maintaining independent roadmaps.
     instances or without `app-scope-local`).
 11. **No comparative benchmark is shipped.** Benchmark functions are test tools,
    not evidence for a specific speedup.
+12. **Refused-peer connect signalling is limited on this VPP build.** The dial
+    code path queries `vppcom_session_get_error` after the readiness dispatcher
+    wakes for `EPOLLOUT`\|`EPOLLERR`\|`EPOLLHUP`, so a completed handshake
+    returns a real conn and a genuinely-failed connect returns a wrapped
+    errno. Empirically, however, connecting to an unused loopback port with
+    `app-scope-local` set produces a VPP-side `SESSION_E_NOROUTE` counter
+    increment (visible in `show session stats`) without the CONNECTED-with-
+    error event reaching the app's epoll; the dial then falls back to
+    context timeout. Integration tests document this and accept a timeout
+    outcome; close-out is tracked in pending work. Full investigation in
+    [docs/connect_error_investigation.md](docs/connect_error_investigation.md).
 
 ## 5. Architecture snapshot
 

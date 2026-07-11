@@ -824,10 +824,31 @@ caller -> owner opCh -> immediate vls_*
 caller Go channel <---------------- event --+
 ```
 
-The public split-connect paths use the selected dispatcher for EPOLLOUT and
-context cancellation. Low-level compatibility dial helpers retain a finite
-legacy wait. Reliable post-EPOLLOUT connect-error verification remains pending
-because the target VPP error attribute is not reliable.
+The public split-connect paths wait on the union of `EPOLLOUT | EPOLLERR |
+EPOLLHUP` through the selected dispatcher, with context cancellation, and
+then call `vclpoll.SessionConnectError` (a wrapper around
+`vppcom_session_get_error`) to reject a stale EPOLLOUT rather than return
+a bogus conn. When VPP does surface the connect error, the query
+translates it: VPP populates `vcl_session_t::vpp_error` inside its
+`SESSION_CTRL_EVT_CONNECTED` handler; `SESSION_E_REFUSED` maps to
+`VPPCOM_ECONNREFUSED`, `SESSION_E_PORTINUSE` to `VPPCOM_EADDRINUSE`, other
+non-zero session errors to `VPPCOM_EFAULT`. The legacy
+`VPPCOM_ATTR_GET_ERROR` stub is bypassed; the dedicated
+`vppcom_session_get_error` entry point returns the actual value.
+
+On the pinned VPP 26.10 build a loopback connect to a port with no
+listener increments the session `no route` counter (visible in
+`show session stats`) but the `SESSION_CTRL_EVT_CONNECTED`-with-error
+event does not appear to reach the app's epoll waiter, so refused-peer
+signalling falls back to context timeout. This is a VPP-side coverage
+gap; the client-side plumbing is regression-safe (no spurious success)
+regardless. Full investigation in
+[connect_error_investigation.md](connect_error_investigation.md).
+
+The low-level compatibility dial helpers (`mode3DialTCP4` /
+`mode3DialTCP6`) predate this addition and still treat EPOLLOUT as
+completion — they exist only for the older internal integration tests and
+are not on the public path.
 
 ### 12.3 Why both avoid M inflation
 
@@ -1341,10 +1362,12 @@ fixed build are required before Mode 2 UDP can be enabled.
 
 The implementation covers TCP on IPv4 and IPv6 in both modes, connected UDP
 in Mode 3, and unconnected UDP via a per-peer session adapter (`ListenPacket`),
-plus context-aware connect and accept, resettable deadlines, HTTP/1.1, layered
-TLS, native VCL TLS (`DialTLS`/`ListenTLS` on top of `VPPCOM_PROTO_TLS`),
-shutdown, TCP half-close, and multi-VPP-worker stress. Mode 3 remains the
-default compatibility dispatcher. Mode 2 is implemented as an opt-in,
+plus context-aware connect and accept (with async-connect completion verified
+through `vppcom_session_get_error`, so refused/unreachable peers surface as
+`ECONNREFUSED`), resettable deadlines, HTTP/1.1, layered TLS, native VCL TLS
+(`DialTLS`/`ListenTLS` on top of `VPPCOM_PROTO_TLS`), shutdown, TCP half-close,
+and multi-VPP-worker stress. Mode 3 remains the default compatibility
+dispatcher. Mode 2 is implemented as an opt-in,
 session-affine TCP worker pool with per-worker epoll, per-worker sharded
 listeners, virtual handles, ownership preflight, exact cancellation, ordered
 teardown, and fail-fast UDP rejection.

@@ -253,14 +253,34 @@ resolve address
   -> vls_connect
        |-- immediate success
        `-- EINPROGRESS/EAGAIN
-             -> selected readiness dispatcher EPOLLOUT with context cancellation
+             -> selected readiness dispatcher (EPOLLOUT | EPOLLERR | EPOLLHUP)
+                with context cancellation
+             -> vppcom_session_get_error to distinguish success from a
+                refused / unreachable / handshake-failed outcome
   -> context/shutdown check
   -> tcpConn
 ```
 
-VPP's session error attribute has historically been unreliable in the target
-build, so the current path treats EPOLLOUT as completion. Reliable post-connect
-error verification is a pending P1 item.
+`VPPCOM_ATTR_GET_ERROR` remains a stub in the pinned VPP 26.10 build, but
+`vppcom_session_get_error` (exposed as `vclpoll.SessionConnectError`)
+inspects the session's `vpp_error` field populated by the
+`SESSION_CTRL_EVT_CONNECTED` handler. `SESSION_E_REFUSED` maps to
+`ECONNREFUSED`, `SESSION_E_PORTINUSE` to `EADDRINUSE`, and any other
+non-zero session error to `EFAULT`. Dial paths wait on the union of the
+success and error events so one waiter covers both outcomes; when the
+waiter wakes for `EPOLLOUT`, the subsequent query rejects a stale event
+by returning a wrapped errno instead of a working conn.
+
+**Coverage gap on this VPP build:** empirically, a connect to an unused
+loopback port with `app-scope-local` set does not deliver the
+`SESSION_CTRL_EVT_CONNECTED`-with-error event to the app's epoll (VPP
+increments the session `no route` counter but the postponed event is
+dropped before generation). The client-side query is wired regardless, so
+this only affects error-signalling latency, not correctness — a real-NIC
+peer that RSTs will surface as `ECONNREFUSED`; loopback misses fall back
+to context-timeout cancellation. Full investigation, VPP source
+references, and reproduction steps are in
+[connect_error_investigation.md](connect_error_investigation.md).
 
 ### Happy Eyeballs
 

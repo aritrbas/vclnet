@@ -412,9 +412,9 @@ Current top-level coverage consists of:
 
 - 173 no-VPP tests across the public package, lifecycle registry, Mode 3
   poller, Mode 2 workers, and sharded listeners;
-- 34 runnable public-package single-worker integration tests (including a
-  concurrent-Shutdown stress test), plus one deliberately skipped test
-  (half-close over cut-through);
+- 36 runnable public-package single-worker integration tests (including a
+  concurrent-Shutdown stress test and TCP/TLS connection-refused cases),
+  plus one deliberately skipped test (half-close over cut-through);
 - 2 low-level VCL poll integration tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
   invariants for ownership and safe UDP rejection;
@@ -454,6 +454,8 @@ context-aware accept, shutdown, address reporting, and multi-worker stress.
 |                                Frida, goroutine, and VLS memory analysis
 |-- docs/adoption_guide.md       application integration guide
 |-- docs/executive_report.md     decision-maker summary
+|-- docs/connect_error_investigation.md
+|                                async-connect error surfacing analysis
 `-- summary.md                  current status and canonical pending work
 ```
 

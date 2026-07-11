@@ -89,9 +89,9 @@ thread.
 
 The no-VPP suite has 173 top-level tests. The VPP-backed suites contain:
 
-- 34 runnable public-package single-worker tests (including native VCL TLS,
-  half-close, layered TLS, deadline, PacketConn echo, Happy Eyeballs, and
-  concurrent-Shutdown stress);
+- 36 runnable public-package single-worker tests (including native VCL TLS,
+  half-close, layered TLS, deadline, PacketConn echo, Happy Eyeballs,
+  concurrent-Shutdown stress, and connection-refused/TLS-refused cases);
 - 2 low-level VCL poll tests;
 - 5 multi-worker stress tests, 1 sharded-accept scaling test, plus 2 Mode 2
   ownership and UDP-rejection invariant tests;
@@ -103,6 +103,10 @@ Covered behavior includes:
 - TCP IPv4/IPv6 connect, listen, accept, read, write, close, and half-close
   (`CloseRead` → local `io.EOF`; `CloseWrite` → peer FIN and local
   `net.ErrClosed`);
+- async-connect completion verified via `vppcom_session_get_error` before
+  a conn is returned, so a stale `EPOLLOUT` cannot yield a spurious
+  success; VPP-side refused-peer delivery is a documented gap on the
+  pinned loopback build;
 - connected UDP IPv4/IPv6 in Mode 3;
 - unconnected UDP (`ListenPacket`) with per-peer session adapter in Mode 3
   (3-message echo round-trip validated);
@@ -196,7 +200,7 @@ A production performance report should capture raw data for:
 | Clean-host packaging | pkg-config template and prefix-driven Make targets | Validate supported distro and container builds |
 | VPP API/behavior drift | Integration harness exercises local VPP | P0 automated version matrix |
 | Unconnected UDP limitation | Per-peer session adapter implemented; `WriteTo` only reaches known peers | Document or mitigate the no-originate-session VPP constraint |
-| Connect failure ambiguity | Immediate hard failures are wrapped | Add reliable post-EPOLLOUT error query/tests |
+| Connect failure ambiguity | Client-side: dial waits on the union of `EPOLLOUT`\|`EPOLLERR`\|`EPOLLHUP` and calls `vppcom_session_get_error` before returning, so a stale EPOLLOUT cannot yield a spurious success; VPP-side: refused-peer signalling doesn't reach the app's epoll on the pinned loopback build (documented in [connect_error_investigation.md](connect_error_investigation.md)) | Reproduce refused/unreachable on a real-NIC topology and confirm the CONNECTED-with-error path is observed |
 | Lifecycle races | `liveRegistry` tracks listeners, conns, PacketConns, and in-flight dials; Shutdown closes listeners first, drains up to 5 s, then force-closes stragglers; concurrent-Shutdown stress covers active accepts/reads/writes/dials | Long-duration soak in CI |
 | Mode 2 rollout risk | Session-affine pool, ownership preflight, per-worker sharded listeners, dual-mode harness | Full-surface soak, CI history, and performance baseline |
 | Mode 2 cut-through UDP crash | UDP fails before VLS allocation; harness probes VPP after tests | Produce and report a minimal reproducer; enable only on a verified-safe VPP build |

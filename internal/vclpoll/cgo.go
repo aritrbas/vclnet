@@ -477,6 +477,25 @@ static int vclpoll_set_v6only(int vlsh, int value) {
                     &value, &buflen);
 }
 
+// Query the session-scoped connect error via VPP's dedicated call. Unlike
+// VPPCOM_ATTR_GET_ERROR (which is a stub returning 0 in the pinned build),
+// vppcom_session_get_error inspects vcl_session_t::vpp_error, which the
+// SESSION_CTRL_EVT_CONNECTED handler populates when the peer rejects the
+// connect (SESSION_E_REFUSED → VPPCOM_ECONNREFUSED, SESSION_E_PORTINUSE →
+// VPPCOM_EADDRINUSE, any other non-zero session error → VPPCOM_EFAULT).
+//
+// Returns 0 if the connect succeeded (session ready), or a negative VPPCOM
+// errno describing the failure. Must be called after EPOLLOUT/EPOLLERR
+// fires — before the SESSION_CTRL_EVT_CONNECTED handler runs, vpp_error is
+// still SESSION_E_NONE.
+static int vclpoll_session_get_connect_error(int vlsh) {
+    vcl_session_handle_t sh = vlsh_to_sh((vls_handle_t)vlsh);
+    if (sh == (vcl_session_handle_t)-1) {
+        return -EBADF;
+    }
+    return vppcom_session_get_error((uint32_t)sh);
+}
+
 // --- UDP support ---
 
 // Create a non-blocking UDP socket bound to an IPv4 address + port.
@@ -884,9 +903,11 @@ func mode3ListenTCP4(ip4 [4]byte, port uint16, backlog int) (VLSH, error) {
 // waiting for the handshake to complete via a temp-epoll EPOLLOUT wait.
 //
 // Note: VPP's VPPCOM_ATTR_GET_ERROR is a stub that always returns 0
-// (memory file findings from frida-vpp), so we do not double-check
-// connection success via SO_ERROR — EPOLLOUT is taken to mean connected,
-// matching what LDP itself does in practice.
+// (memory file findings from frida-vpp), so this legacy compatibility
+// helper does not distinguish success from failure — EPOLLOUT is taken
+// to mean connected. Public API dial paths use the split-connect helpers
+// plus rawSessionConnectError (vppcom_session_get_error) to disambiguate
+// EPOLLOUT-because-connected from EPOLLOUT-because-refused.
 func mode3DialTCP4(ip4 [4]byte, port uint16) (VLSH, error) {
 	defer pin()()
 
@@ -1039,6 +1060,14 @@ func mode3Close(vlsh VLSH) error {
 func mode3Shutdown(vlsh VLSH, how int) error {
 	defer pin()()
 	return rawShutdown(vlsh, how)
+}
+
+// mode3SessionConnectError queries VPP for an async connect result. Pins
+// the goroutine so the vppcom_session_get_error CGo call runs against a
+// registered VCL worker.
+func mode3SessionConnectError(vlsh VLSH) error {
+	defer pin()()
+	return rawSessionConnectError(vlsh)
 }
 
 func isAgain(rv int) bool {
@@ -1224,6 +1253,26 @@ func rawShutdown(vlsh VLSH, how int) error {
 		return vppErr("shutdown", int(rv))
 	}
 	return nil
+}
+
+// rawSessionConnectError queries VPP for the connect result of an
+// asynchronously-connected session. Callers MUST issue this after the
+// readiness wait wakes them (EPOLLOUT / EPOLLERR / EPOLLHUP) so VPP has
+// already delivered SESSION_CTRL_EVT_CONNECTED and populated
+// vcl_session_t::vpp_error. A return of nil means the connect succeeded
+// and the session is ready for I/O; a non-nil *VCLError carries a
+// syscall.Errno translated from vppcom_session_get_error's negative
+// VPPCOM_E* result (ECONNREFUSED, EADDRINUSE, EFAULT for other errors,
+// or EBADFD if the handle no longer resolves).
+//
+// Not concurrency-safe with parallel Close on the same vlsh; the dispatcher
+// wraps this with the same pin/owner-submit discipline as other VLS calls.
+func rawSessionConnectError(vlsh VLSH) error {
+	rv := C.vclpoll_session_get_connect_error(C.int(vlsh))
+	if rv >= 0 {
+		return nil
+	}
+	return vppErr("connect", int(rv))
 }
 
 // rawAddCertKeyPair registers a PEM cert+key pair with VPP and returns the

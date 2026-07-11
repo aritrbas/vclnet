@@ -41,6 +41,11 @@ type dispatcher interface {
 	write(VLSH, []byte) (int, error)
 	writeContext(VLSH, []byte, <-chan struct{}) (int, error)
 	shutdown(VLSH, int) error
+	// sessionConnectError inspects the session's post-connect error. Callers
+	// invoke it after the readiness dispatcher wakes them for EPOLLOUT so
+	// VPP has already delivered the SESSION_CTRL_EVT_CONNECTED reply. See
+	// rawSessionConnectError for the underlying VPP call.
+	sessionConnectError(VLSH) error
 	close(VLSH) error
 	closeVLSH(VLSH)
 	getLocalAddr(VLSH) (AddrInfo, error)
@@ -243,6 +248,20 @@ const (
 func Shutdown(vlsh VLSH, how int) error {
 	return currentDispatcher().shutdown(vlsh, how)
 }
+
+// SessionConnectError returns the outcome of an asynchronous connect. Call
+// this after PollWaitContext for EPOLLOUT/EPOLLERR/EPOLLHUP wakes the
+// caller — a nil result means the connect completed successfully (session
+// is ready for I/O), a non-nil *VCLError wraps the syscall.Errno translated
+// from VPP's session error (ECONNREFUSED, EADDRINUSE, or EFAULT for other
+// failures).
+//
+// Not concurrency-safe with a parallel Close on the same vlsh; the
+// dispatcher pins the calling thread (mode 3) or routes to the owning
+// worker (mode 2) so the query serialises with other VLS calls.
+func SessionConnectError(vlsh VLSH) error {
+	return currentDispatcher().sessionConnectError(vlsh)
+}
 func GetLocalAddr(vlsh VLSH) (AddrInfo, error) {
 	return currentDispatcher().getLocalAddr(vlsh)
 }
@@ -341,6 +360,7 @@ func (mode3Dispatcher) writeContext(h VLSH, p []byte, done <-chan struct{}) (int
 	return mode3WriteContext(h, p, done)
 }
 func (mode3Dispatcher) shutdown(h VLSH, how int) error               { return mode3Shutdown(h, how) }
+func (mode3Dispatcher) sessionConnectError(h VLSH) error             { return mode3SessionConnectError(h) }
 func (mode3Dispatcher) close(h VLSH) error                           { return mode3Close(h) }
 func (mode3Dispatcher) closeVLSH(h VLSH)                             { mode3CloseVLSH(h) }
 func (mode3Dispatcher) getLocalAddr(h VLSH) (AddrInfo, error)        { return mode3GetLocalAddr(h) }

@@ -426,6 +426,13 @@ func (d *mode2Dispatcher) shutdown(handle VLSH, how int) error {
 	return err
 }
 
+func (d *mode2Dispatcher) sessionConnectError(handle VLSH) error {
+	_, err := d.sessionCall(handle, func(_ *worker, raw VLSH) (any, error) {
+		return nil, rawSessionConnectError(raw)
+	})
+	return err
+}
+
 func (d *mode2Dispatcher) close(handle VLSH) error {
 	if sl := d.lookupShardedListener(handle); sl != nil {
 		return d.closeShardedListener(sl)
